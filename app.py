@@ -654,8 +654,10 @@ class TunnerApp(App[None]):
 
     def update_layout(self, width: int) -> None:
         # Reserve room for setting names as well as the 43-column controls.
-        self.screen.set_class(width < 120, "narrow")
-        self.screen.set_class(width < 80, "compact")
+        # The tuning screen stays at the bottom when confirmation is open.
+        tuning_screen = self.screen_stack[0]
+        tuning_screen.set_class(width < 120, "narrow")
+        tuning_screen.set_class(width < 80, "compact")
 
     def on_value_row_changed(self, event: ValueRow.Changed) -> None:
         self.last_change = datetime.now()

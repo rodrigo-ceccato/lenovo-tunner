@@ -5,11 +5,17 @@ from unittest.mock import patch
 
 from textual.widgets import Button
 
-from app import TunnerApp, TuningValue, ValueRow
+from app import ApplyConfirmation, TunnerApp, TuningValue, ValueRow
 
 
 class LayoutTest(unittest.IsolatedAsyncioTestCase):
     async def test_controls_remain_visible_after_resize(self):
+        await self.check_resize_layout(confirmation_open=False)
+
+    async def test_controls_remain_visible_after_resize_with_confirmation(self):
+        await self.check_resize_layout(confirmation_open=True)
+
+    async def check_resize_layout(self, *, confirmation_open):
         setting = TuningValue("CPU P-core maximum frequency", 3000, 800, 5400, "MHz", 100)
         with (
             patch("app.load_values", return_value=[setting]),
@@ -22,8 +28,14 @@ class LayoutTest(unittest.IsolatedAsyncioTestCase):
         ):
             app = TunnerApp()
             async with app.run_test(size=(80, 24)) as pilot:
-                for width in (80, 60, 119, 120, 140, 80):
+                for width in (80, 60, 119, 120, 140, 60, 140, 80):
+                    if confirmation_open:
+                        app.push_screen(ApplyConfirmation(), app.apply_confirmed)
+                        await pilot.pause()
                     await pilot.resize_terminal(width, 24)
+                    if confirmation_open:
+                        self.assertTrue(await pilot.click("#cancel"))
+                        await pilot.pause()
                     row = app.query_one(ValueRow)
                     row.scroll_visible(immediate=True)
                     await pilot.pause()

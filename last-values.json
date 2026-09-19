@@ -1,0 +1,17 @@
+{
+  "updated_at": "2026-09-19T14:31:54-03:00",
+  "values": {
+    "cpu-maximum-frequency": 2000,
+    "cpu-minimum-frequency": 1400,
+    "lenovo-cpu-burst-limit": 119,
+    "lenovo-cpu-cross-load-limit": 55,
+    "lenovo-cpu-sustained-limit": 70,
+    "lenovo-cpu-temperature-target": 97,
+    "lenovo-gpu-temperature-target": 85,
+    "nvidia-core-clock-maximum": 1860,
+    "nvidia-core-clock-minimum": 1860,
+    "nvidia-memory-clock-maximum": 6001,
+    "nvidia-memory-clock-minimum": 6001,
+    "nvidia-power-ceiling": 175
+  }
+}
