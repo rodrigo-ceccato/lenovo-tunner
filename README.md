@@ -1,9 +1,9 @@
 # Tunner
 
 A minimal TUI for the adjustable ranges documented in
-`lenovo-tuning.md`. At startup it also reads the CPU frequency policies and
-uses read-only NVIDIA queries to discover the current GPU clocks and
-driver-supported clock steps. It does not execute, save, or generate
+`lenovo-tuning.md`. At startup it reads the active Lenovo firmware values and
+CPU frequency policies, and uses read-only NVIDIA queries to discover the
+current GPU clocks, power limit, and driver-supported ranges. It does not execute, save, or generate
 hardware-tuning commands until you choose **Apply** and confirm it.
 
 ```sh
@@ -66,6 +66,11 @@ The top of the screen refreshes CPU and GPU sensor telemetry every two seconds,
 and the activity light reports recent changes and applies. If NVIDIA clock
 telemetry cannot be read, its controls remain visible but disabled; this does
 not imply that the GPU itself is absent.
+
+The **Apply command log** shows the commands attempted by the latest Apply and
+whether each one succeeded. Every external command Tunner launches, including
+read-only telemetry and probes, is also appended to `log.txt` with a timestamp
+and a `READ`, `WRITE`, or `EXEC` label.
 
 The **Stress CPU** and **Stress GPU** buttons start separate workloads only when
 clicked; clicking an active button stops its workload, and closing Tunner stops

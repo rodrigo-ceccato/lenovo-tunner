@@ -12,17 +12,27 @@ from pathlib import Path
 import json
 import sys
 import intel_controls
+from command_log import record_command, render_command
 
 from textual.app import App, ComposeResult
 from textual.events import Resize
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Header, Label, Static, Select
+from textual.validation import Number
+from textual.widgets import Button, Footer, Header, Input, Label, RichLog, Static, Select
 
 
 DOCUMENT = Path(__file__).with_name("lenovo-tuning.md")
 LAST_VALUES = Path(__file__).with_name("last-values.json")
+LENOVO_ATTRIBUTES = {
+    "lenovo-cpu-cross-load-limit": "ppt_cpu_cl",
+    "lenovo-cpu-sustained-limit": "ppt_pl1_spl",
+    "lenovo-cpu-burst-limit": "ppt_pl2_sppt",
+    "lenovo-cpu-temperature-target": "cpu_temp",
+    "lenovo-gpu-temperature-target": "gpu_temp",
+}
+LENOVO_ATTRIBUTE_ROOT = Path("/sys/class/firmware-attributes/lenovo-wmi-other-0/attributes")
 RANGE_PATTERN = re.compile(
     r"allowed range:\s*(?P<minimum>\d+)\s*[–-]\s*(?P<maximum>\d+)\s*(?P<unit>[^. `|]+)",
     re.IGNORECASE,
@@ -139,7 +149,7 @@ def load_values(document: Path = DOCUMENT) -> list[TuningValue]:
                     unit=match["unit"],
                 )
             )
-    return values
+    return probe_documented_values(values)
 
 
 def policy_values(filename: str) -> list[int]:
@@ -207,13 +217,60 @@ def cpu_clock_values() -> list[TuningValue]:
 
 def nvidia_output(arguments: list[str]) -> str:
     """Run a read-only NVIDIA query; no shell or setting-changing option is used."""
-    return subprocess.run(
-        ["nvidia-smi", *arguments],
+    return run_command(
+        ["nvidia-smi", *arguments], access="read",
         check=True,
         capture_output=True,
         text=True,
         timeout=3,
     ).stdout
+
+
+def run_command(
+    arguments: list[str], *, access: str, input_text: str | None = None, **kwargs
+) -> subprocess.CompletedProcess[str]:
+    """Log and run one external command without invoking a shell."""
+    record_command(arguments, access, input_text)
+    return subprocess.run(arguments, input=input_text, **kwargs)
+
+
+def probe_documented_values(settings: list[TuningValue]) -> list[TuningValue]:
+    """Replace documented examples with current firmware and driver values."""
+    by_key = {setting.key: setting for setting in settings}
+    for key, attribute in LENOVO_ATTRIBUTES.items():
+        setting = by_key.get(key)
+        if setting is None:
+            continue
+        try:
+            value = int((LENOVO_ATTRIBUTE_ROOT / attribute / "current_value").read_text().strip())
+            if not setting.minimum <= value <= setting.maximum:
+                raise ValueError("value outside documented range")
+            setting.value = value
+        except (OSError, ValueError):
+            setting.value = None
+            setting.unavailable_reason = "Live Lenovo value unavailable"
+
+    power = by_key.get("nvidia-power-ceiling")
+    if power is not None:
+        try:
+            report = nvidia_output(
+                [
+                    "-i",
+                    "0",
+                    "--query-gpu=enforced.power.limit,power.min_limit,power.max_limit",
+                    "--format=csv,noheader,nounits",
+                ]
+            ).splitlines()[0]
+            current, minimum, maximum = (round(float(value.strip())) for value in report.split(","))
+            if minimum < 0 or maximum < minimum or not minimum <= current <= maximum:
+                raise ValueError("invalid NVIDIA power limits")
+            power.value = current
+            power.minimum = minimum
+            power.maximum = maximum
+        except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+            power.value = None
+            power.unavailable_reason = "Live NVIDIA power limit unavailable"
+    return settings
 
 
 def supported_nvidia_clocks(report: str) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -271,18 +328,11 @@ def nvidia_clock_values() -> list[TuningValue]:
             choices=supported if choices is None else choices,
         )
 
-    memory_choices = tuple(sorted({
-        memory[0],
-        memory[-1],
-        memory_current,
-        *range(((memory[0] + 99) // 100) * 100, memory[-1] + 1, 100),
-    }))
-
     return [
         clock("NVIDIA core clock minimum", graphics_current, graphics),
         clock("NVIDIA core clock maximum", graphics_current, graphics),
-        clock("NVIDIA memory clock minimum", memory_current, memory, memory_choices),
-        clock("NVIDIA memory clock maximum", memory_current, memory, memory_choices),
+        clock("NVIDIA memory clock minimum", memory_current, memory, ()),
+        clock("NVIDIA memory clock maximum", memory_current, memory, ()),
     ]
 
 
@@ -308,8 +358,9 @@ def read_telemetry() -> Telemetry:
     telemetry = Telemetry()
     try:
         report = json.loads(
-            subprocess.run(
-                ["sensors", "-j"], check=True, capture_output=True, text=True, timeout=3
+            run_command(
+                ["sensors", "-j"], access="read",
+                check=True, capture_output=True, text=True, timeout=3
             ).stdout
         )
         for chip in report.values():
@@ -445,7 +496,19 @@ class ValueRow(Horizontal):
         yield Label(self.setting.name, classes="setting-name")
         yield Static("", id="range", classes="range")
         yield Button("−", id="down", classes="step")
-        yield Static("", id="value", classes="value")
+        if self.setting.key.startswith("nvidia-memory-clock"):
+            yield Input(
+                "" if self.setting.value is None else str(self.setting.value),
+                id="value",
+                classes="value",
+                disabled=self.setting.value is None and self.setting.unavailable_reason is not None,
+                restrict=r"\d*",
+                validators=Number(self.setting.minimum, self.setting.maximum),
+                validate_on=["changed"],
+                compact=True,
+            )
+        else:
+            yield Static("", id="value", classes="value")
         yield Button("+", id="up", classes="step")
 
     def on_mount(self) -> None:
@@ -454,6 +517,17 @@ class ValueRow(Horizontal):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.setting.change(-1 if event.button.id == "down" else 1)
         self.refresh_value()
+        self.post_message(self.Changed(self))
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.validation_result is None or not event.validation_result.is_valid:
+            if self.setting.value is not None:
+                self.setting.value = None
+                self.refresh_buttons()
+                self.post_message(self.Changed(self))
+            return
+        self.setting.value = int(event.value)
+        self.refresh_buttons()
         self.post_message(self.Changed(self))
 
     def refresh_value(self) -> None:
@@ -466,7 +540,16 @@ class ValueRow(Horizontal):
             else f"{self.setting.value} {self.setting.unit}"
         )
         self.query_one("#range", Static).update(range_text)
-        self.query_one("#value", Static).update(value_text)
+        value = self.query_one("#value")
+        if isinstance(value, Input):
+            expected = "" if self.setting.value is None else str(self.setting.value)
+            if value.value != expected:
+                value.value = expected
+        else:
+            value.update(value_text)
+        self.refresh_buttons()
+
+    def refresh_buttons(self) -> None:
         self.query_one("#down", Button).disabled = not self.setting.can_change(-1)
         self.query_one("#up", Button).disabled = not self.setting.can_change(1)
 
@@ -585,6 +668,8 @@ class TunnerApp(App[None]):
     .step:focus { background: #3d4655; }
     #actions { height: 3; margin-top: 1; }
     #actions Button { margin-right: 1; }
+    #apply-log-title { color: #86b7ff; text-style: bold; margin-top: 1; }
+    #apply-log { height: 10; border: solid #303641; padding: 0 1; background: #181b20; }
     #status-rail { width: 38; min-width: 34; height: 1fr; padding: 1 2; background: #181b20; border: solid #303641; }
     Screen.narrow #status-rail { display: none; }
     Screen.narrow #tuning-plan { padding-right: 0; }
@@ -657,6 +742,8 @@ class TunnerApp(App[None]):
                     yield Button("Stress GPU", id="stress-gpu", variant="warning")
                     yield Button("Restore saved", id="restore")
                     yield Button("Apply", id="apply", variant="error")
+                yield Static("APPLY COMMAND LOG", id="apply-log-title")
+                yield RichLog(id="apply-log", wrap=True, markup=False, max_lines=200)
             yield StatusRail(id="status-rail")
         yield Footer()
 
@@ -707,8 +794,10 @@ class TunnerApp(App[None]):
             self.query_one("#activity", Static).update(f"● {target.upper()} stress stopped")
             return
 
+        arguments = [sys.executable, str(Path(__file__).with_name("stress.py")), target]
+        record_command(arguments, "exec")
         self.stress_processes[target] = subprocess.Popen(
-            [sys.executable, str(Path(__file__).with_name("stress.py")), target],
+            arguments,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
@@ -773,7 +862,10 @@ class TunnerApp(App[None]):
             elif row.setting.key.startswith("nvidia-core-clock"):
                 row.disabled = self.options['core-mode'] != 'locked'
             elif row.setting.key.startswith("nvidia-memory-clock"):
-                row.disabled = self.options['memory-mode'] != 'locked'
+                row.disabled = (
+                    self.options['memory-mode'] != 'locked'
+                    or row.setting.value is None and row.setting.unavailable_reason is not None
+                )
 
     def refresh_telemetry(self) -> None:
         self.query_one(StatusRail).refresh_status(self.settings, read_telemetry())
@@ -848,18 +940,31 @@ class TunnerApp(App[None]):
     def apply_confirmed(self, approved: bool | None) -> None:
         if not approved:
             return
+        apply_log = self.query_one("#apply-log", RichLog)
+        apply_log.clear()
+        command_failure_logged = False
         try:
             commands = self.apply_commands()
             for arguments, input_text in commands:
-                subprocess.run(
-                    arguments,
-                    input=input_text,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                )
+                rendered = render_command(arguments, input_text)
+                try:
+                    run_command(
+                        arguments,
+                        access="write",
+                        input_text=input_text,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                except (OSError, subprocess.SubprocessError) as error:
+                    apply_log.write(f"FAILED   {rendered}: {error}")
+                    command_failure_logged = True
+                    raise
+                apply_log.write(f"APPLIED  {rendered}")
         except (OSError, subprocess.SubprocessError, ValueError) as error:
+            if not command_failure_logged:
+                apply_log.write(f"FAILED   Apply could not start: {error}")
             self.query_one("#activity", Static).update(
                 f"● Apply failed: {error}. Run 'sudo -v' in the terminal, then retry."
             )
@@ -889,7 +994,10 @@ class TunnerApp(App[None]):
         write('/sys/firmware/acpi/platform_profile', profile)
         if profile == 'custom':
             for key, attribute in [('lenovo-cpu-cross-load-limit', 'ppt_cpu_cl'), ('lenovo-cpu-sustained-limit', 'ppt_pl1_spl'), ('lenovo-cpu-burst-limit', 'ppt_pl2_sppt'), ('lenovo-cpu-temperature-target', 'cpu_temp'), ('lenovo-gpu-temperature-target', 'gpu_temp')]:
-                write(f'/sys/class/firmware-attributes/lenovo-wmi-other-0/attributes/{attribute}/current_value', values[key])
+                value = values[key]
+                if value is None:
+                    raise ValueError(f'{key} unavailable')
+                write(f'/sys/class/firmware-attributes/lenovo-wmi-other-0/attributes/{attribute}/current_value', value)
         if turbo_state() is None:
             raise ValueError('Turbo state unavailable')
         turbo = self.options['turbo'] == 'on'
@@ -908,7 +1016,10 @@ class TunnerApp(App[None]):
                 write(policy / 'scaling_max_freq', high * 1000)
                 write(policy / 'scaling_min_freq', low * 1000)
         if self.nvidia_power_limit_available:
-            commands.append((["sudo", "-n", "nvidia-smi", "-i", "0", "-pl", str(values['nvidia-power-ceiling'])], None))
+            power_limit = values['nvidia-power-ceiling']
+            if power_limit is None:
+                raise ValueError('NVIDIA power limit unavailable')
+            commands.append((["sudo", "-n", "nvidia-smi", "-i", "0", "-pl", str(power_limit)], None))
         for domain, lock, reset in [('core', '-lgc', '-rgc'), ('memory', '-lmc', '-rmc')]:
             mode = self.options[f'{domain}-mode']
             if mode == 'keep':

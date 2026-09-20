@@ -7,6 +7,8 @@ import subprocess
 import sys
 from datetime import datetime
 
+from command_log import record_command
+
 CONFIG = Path('/etc/intel-undervolt.conf')
 SPECS = {
     'intel-pl1-sustained-power': (1, 157, 'W', 1),
@@ -108,7 +110,9 @@ def main():
     shutil.copy2(CONFIG, backup)
     try:
         CONFIG.write_text(replacement)
-        subprocess.run(['intel-undervolt', 'apply'], check=True, capture_output=True, text=True, timeout=10)
+        command = ['intel-undervolt', 'apply']
+        record_command(command, 'write')
+        subprocess.run(command, check=True, capture_output=True, text=True, timeout=10)
     except Exception:
         CONFIG.write_text(original)
         raise RuntimeError(f'Intel apply failed; config restored from {backup}. Hardware may be partially changed.')
