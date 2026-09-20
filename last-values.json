@@ -1,17 +1,32 @@
 {
-  "updated_at": "2026-09-19T14:31:54-03:00",
+  "applied_at": "2026-09-19T16:38:53-03:00",
+  "options": {
+    "core-mode": "locked",
+    "intel-mode": "apply",
+    "memory-mode": "locked",
+    "profile": "max-power",
+    "turbo": "off"
+  },
+  "updated_at": "2026-09-20T11:23:05-03:00",
   "values": {
-    "cpu-maximum-frequency": 2000,
-    "cpu-minimum-frequency": 1400,
+    "cpu-e-core-maximum-frequency": 2000,
+    "cpu-e-core-minimum-frequency": 800,
+    "cpu-p-core-maximum-frequency": 3500,
+    "cpu-p-core-minimum-frequency": 800,
+    "intel-pl1-sustained-power": 45,
+    "intel-pl1-time-window": 14000,
+    "intel-pl2-burst-power": 54,
+    "intel-pl2-time-window": 1500,
+    "intel-thermal-offset": -13,
     "lenovo-cpu-burst-limit": 119,
     "lenovo-cpu-cross-load-limit": 55,
     "lenovo-cpu-sustained-limit": 70,
     "lenovo-cpu-temperature-target": 97,
-    "lenovo-gpu-temperature-target": 85,
-    "nvidia-core-clock-maximum": 1860,
-    "nvidia-core-clock-minimum": 1860,
+    "lenovo-gpu-temperature-target": 87,
+    "nvidia-core-clock-maximum": 1410,
+    "nvidia-core-clock-minimum": 1410,
     "nvidia-memory-clock-maximum": 6001,
-    "nvidia-memory-clock-minimum": 6001,
-    "nvidia-power-ceiling": 175
+    "nvidia-memory-clock-minimum": 405,
+    "nvidia-power-ceiling": 170
   }
 }

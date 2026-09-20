@@ -15,6 +15,21 @@ SPECS = {
     'intel-pl2-time-window': (1, 128000, 'ms', 250),
     'intel-thermal-offset': (-30, 0, '°C', 1),
 }
+LIVE_DEFAULTS = {
+    'intel-pl1-sustained-power': 45,
+    'intel-pl1-time-window': 28000,
+    'intel-pl2-burst-power': 55,
+    'intel-pl2-time-window': 2000,
+    'intel-thermal-offset': -10,
+}
+
+def validate_values(values):
+    for key, (low, high, _, _) in SPECS.items():
+        value = values.get(key)
+        if type(value) is not int or not low <= value <= high:
+            raise ValueError(f'{key} must be between {low} and {high}')
+    if values['intel-pl1-sustained-power'] > values['intel-pl2-burst-power']:
+        raise ValueError('Intel PL1 must not exceed PL2')
 
 def parse_config(text):
     power = re.findall(r'^\s*power\s+package\s+([^\s#]+)\s+([^\s#]+)\s*(?:#.*)?$', text, re.M)
@@ -32,15 +47,46 @@ def parse_config(text):
 
 def updated_config(text, values):
     parse_config(text)
-    for key, (low, high, _, _) in SPECS.items():
-        value = values.get(key)
-        if type(value) is not int or not low <= value <= high:
-            raise ValueError(f'{key} must be between {low} and {high}')
-    if values['intel-pl1-sustained-power'] > values['intel-pl2-burst-power']:
-        raise ValueError('Intel PL1 must not exceed PL2')
+    validate_values(values)
     line = f"power package {values['intel-pl2-burst-power']}/{values['intel-pl2-time-window']/1000:g} {values['intel-pl1-sustained-power']}/{values['intel-pl1-time-window']/1000:g}"
     text = re.sub(r'^\s*power\s+package[^\n]*', line, text, flags=re.M)
     return re.sub(r'^\s*tjoffset[^\n]*', f"tjoffset {values['intel-thermal-offset']}", text, flags=re.M)
+
+def python_undervolt_command(values, executable=sys.executable):
+    """Build a live-only MSR command for the Python undervolt package."""
+    validate_values(values)
+    return [
+        'sudo', '-n', executable, '-m', 'undervolt',
+        '-p1', str(values['intel-pl1-sustained-power']),
+        f"{values['intel-pl1-time-window'] / 1000:g}",
+        '-p2', str(values['intel-pl2-burst-power']),
+        f"{values['intel-pl2-time-window'] / 1000:g}",
+        '--temp', str(100 + values['intel-thermal-offset']),
+    ]
+
+def live_control_values():
+    """Return editable live-mode values without requiring a persistent config."""
+    values = LIVE_DEFAULTS.copy()
+    root = Path('/sys/class/powercap/intel-rapl:0')
+    paths = {
+        'intel-pl1-sustained-power': (root / 'constraint_0_power_limit_uw', 1_000_000),
+        'intel-pl1-time-window': (root / 'constraint_0_time_window_us', 1_000),
+        'intel-pl2-burst-power': (root / 'constraint_1_power_limit_uw', 1_000_000),
+        'intel-pl2-time-window': (root / 'constraint_1_time_window_us', 1_000),
+    }
+    for key, (path, divisor) in paths.items():
+        try:
+            value = round(int(path.read_text()) / divisor)
+        except (OSError, ValueError):
+            continue
+        low, high, _, _ = SPECS[key]
+        if low <= value <= high:
+            values[key] = value
+    if values['intel-pl1-sustained-power'] > values['intel-pl2-burst-power']:
+        values.update({key: LIVE_DEFAULTS[key] for key in (
+            'intel-pl1-sustained-power', 'intel-pl2-burst-power'
+        )})
+    return values
 
 def live_limits():
     lines = []

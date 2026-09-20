@@ -12,8 +12,8 @@ sudo -v
 ```
 
 Use the `−` and `+` buttons to preview values within their documented or
-driver-reported ranges. CPU clocks use 100 MHz steps; GPU clocks use only
-driver-reported supported steps. The left pane groups the controls into CPU,
+driver-reported ranges. CPU and GPU memory clocks use 100 MHz steps; GPU core
+clocks use driver-reported supported steps. The left pane groups the controls into CPU,
 Lenovo Custom Mode, and NVIDIA sections. The persistent right pane refreshes
 live temperatures, driver-reported GPU thermal margin, enforced GPU power
 ceiling, utilization, clocks, and clock slowdown reasons. CPU policy ranges
@@ -44,14 +44,20 @@ to a 90°C target on this CPU). Windows are entered in milliseconds; the CPU
 rounds them to supported values. They are averaging windows, not exact timers.
 The right pane reads back live RAPL power limits and windows.
 
-Select **Apply Intel power / time / thermal settings** to include these in
-the confirmed Apply. This updates `/etc/intel-undervolt.conf`, saves a timestamped
+Select **Apply persistently via intel-undervolt** to include these in the
+confirmed Apply. This updates `/etc/intel-undervolt.conf`, saves a timestamped
 backup beside it, and runs `intel-undervolt apply`, including the existing voltage
 offsets. On failure the original configuration is restored, but hardware may
 have been partially changed. Settings can be reapplied by your existing service
 at boot. The app does not enable that service. UI ranges are application bounds,
 not a guarantee that firmware accepts every value. Lenovo and Intel limits can
 both constrain performance; an unsupported Lenovo time-window range is not editable.
+
+The alternative **Apply live via Python undervolt** mode uses the `undervolt`
+Python package to write PL1, PL2, their windows, and the thermal target directly
+through Intel MSRs. It does not change voltage offsets or configuration files,
+and its limits are not persistent across reboot. This mode requires the `msr`
+kernel module and the project dependency installed from `requirements.txt`.
 
 **Apply** opens a confirmation dialog, then runs the documented CPU, Lenovo,
 and NVIDIA commands. Authenticate first in the terminal with `sudo -v`; the
@@ -60,3 +66,13 @@ The top of the screen refreshes CPU and GPU sensor telemetry every two seconds,
 and the activity light reports recent changes and applies. If NVIDIA clock
 telemetry cannot be read, its controls remain visible but disabled; this does
 not imply that the GPU itself is absent.
+
+The **Stress CPU** and **Stress GPU** buttons start separate workloads only when
+clicked; clicking an active button stops its workload, and closing Tunner stops
+both. CPU stress uses Python's `multiprocessing` module to load every logical
+CPU. GPU stress uses the optional [CuPy](https://cupy.dev/) Python library to
+run CUDA matrix multiplications. Install the CuPy wheel matching your CUDA
+runtime before using GPU stress. CUDA 12 users can run
+`pip install -r requirements-gpu-cuda12.txt`; for other CUDA versions, install
+the corresponding CuPy package instead. A startup failure is shown in the app
+and resets the stress button.

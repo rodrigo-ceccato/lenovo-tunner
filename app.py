@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import signal
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -254,21 +256,33 @@ def nvidia_clock_values() -> list[TuningValue]:
             TuningValue("NVIDIA memory clock maximum", None, 0, 0, "MHz", unavailable_reason=unavailable),
         ]
 
-    def clock(name: str, current_value: int, supported: tuple[int, ...]) -> TuningValue:
+    def clock(
+        name: str,
+        current_value: int,
+        supported: tuple[int, ...],
+        choices: tuple[int, ...] | None = None,
+    ) -> TuningValue:
         return TuningValue(
             name,
             current_value,
             supported[0],
             supported[-1],
             "MHz",
-            choices=supported,
+            choices=supported if choices is None else choices,
         )
+
+    memory_choices = tuple(sorted({
+        memory[0],
+        memory[-1],
+        memory_current,
+        *range(((memory[0] + 99) // 100) * 100, memory[-1] + 1, 100),
+    }))
 
     return [
         clock("NVIDIA core clock minimum", graphics_current, graphics),
         clock("NVIDIA core clock maximum", graphics_current, graphics),
-        clock("NVIDIA memory clock minimum", memory_current, memory),
-        clock("NVIDIA memory clock maximum", memory_current, memory),
+        clock("NVIDIA memory clock minimum", memory_current, memory, memory_choices),
+        clock("NVIDIA memory clock maximum", memory_current, memory, memory_choices),
     ]
 
 
@@ -594,7 +608,9 @@ class TunnerApp(App[None]):
         super().__init__()
         self.settings = load_values() + cpu_clock_values() + nvidia_clock_values() + intel_values()
         self.nvidia_power_limit_available = nvidia_power_limit_available()
+        self.stress_processes: dict[str, subprocess.Popen[str]] = {}
         self.last_change: datetime | None = None
+        self.last_apply: datetime | None = None
         try:
             self.profiles = Path('/sys/firmware/acpi/platform_profile_choices').read_text().split()
             profile = Path('/sys/firmware/acpi/platform_profile').read_text().strip()
@@ -614,8 +630,8 @@ class TunnerApp(App[None]):
                 )
                 yield Static("", id="activity")
                 yield Label("Intel package limits · persistent configuration")
-                yield Select([('Keep current Intel settings', 'keep'), ('Apply Intel power / time / thermal settings', 'apply')], value='keep', allow_blank=False, id='intel-mode')
-                yield Static('Intel windows use milliseconds (1000 ms = 1 s), not exact boost timers. Thermal offset is relative to 100°C on this CPU. Apply updates /etc/intel-undervolt.conf and reapplies its existing voltage offsets. UI bounds are app limits, not hardware guarantees.')
+                yield Select([('Keep current Intel settings', 'keep'), ('Apply persistently via intel-undervolt', 'apply'), ('Apply live via Python undervolt', 'undervolt')], value='keep', allow_blank=False, id='intel-mode')
+                yield Static('Intel windows use milliseconds (1000 ms = 1 s), not exact boost timers. Thermal offset is relative to 100°C on this CPU. Persistent apply updates /etc/intel-undervolt.conf and reapplies its existing voltage offsets. Python undervolt writes only these live limits through MSRs and does not persist them. UI bounds are app limits, not hardware guarantees.')
                 yield Label("Lenovo profile · firmware sliders apply only in Custom")
                 yield Select([(p, p) for p in self.profiles] or [("Unavailable", "unavailable")], value=self.options['profile'], allow_blank=False, id="profile", disabled=not self.profiles)
                 yield Label("CPU Turbo · ceilings above base require Turbo on")
@@ -637,6 +653,8 @@ class TunnerApp(App[None]):
                         previous_group = group
                     yield ValueRow(setting)
                 with Horizontal(id="actions"):
+                    yield Button("Stress CPU", id="stress-cpu", variant="warning")
+                    yield Button("Stress GPU", id="stress-gpu", variant="warning")
                     yield Button("Restore saved", id="restore")
                     yield Button("Apply", id="apply", variant="error")
             yield StatusRail(id="status-rail")
@@ -666,6 +684,9 @@ class TunnerApp(App[None]):
         self.refresh_telemetry()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id in ("stress-cpu", "stress-gpu"):
+            self.toggle_stress(event.button.id.removeprefix("stress-"))
+            return
         if event.button.id in ("reset-core", "reset-memory"):
             domain = event.button.id.removeprefix("reset-")
             self.query_one(f"#{domain}-mode", Select).value = "auto"
@@ -674,15 +695,79 @@ class TunnerApp(App[None]):
         elif event.button.id == "apply":
             self.push_screen(ApplyConfirmation(), self.apply_confirmed)
 
+    def toggle_stress(self, target: str) -> None:
+        """Launch or stop an isolated opt-in workload without blocking the TUI."""
+        self.refresh_stress_processes()
+        button = self.query_one(f"#stress-{target}", Button)
+        process = self.stress_processes.get(target)
+        if process is not None and process.poll() is None:
+            self.stop_stress(process)
+            self.stress_processes.pop(target)
+            button.label = f"Stress {target.upper()}"
+            self.query_one("#activity", Static).update(f"● {target.upper()} stress stopped")
+            return
+
+        self.stress_processes[target] = subprocess.Popen(
+            [sys.executable, str(Path(__file__).with_name("stress.py")), target],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        button.label = f"Stop {target.upper()} stress"
+        self.query_one("#activity", Static).update(f"● {target.upper()} stress started; click again to stop")
+
+    def refresh_stress_processes(self) -> bool:
+        """Reap finished workloads and report failures instead of leaving stale UI."""
+        failure_reported = False
+        for target, process in list(self.stress_processes.items()):
+            returncode = process.poll()
+            if returncode is None:
+                continue
+
+            self.stress_processes.pop(target)
+            self.query_one(f"#stress-{target}", Button).label = f"Stress {target.upper()}"
+            stderr = process.stderr.read().strip() if process.stderr is not None else ""
+            if returncode != 0:
+                detail = stderr.splitlines()[-1] if stderr else f"exit status {returncode}"
+                message = f"{target.upper()} stress failed: {detail}"
+                activity = self.query_one("#activity", Static)
+                activity.styles.color = "#ff6b6b"
+                activity.update(f"● {message}")
+                self.notify(message, severity="error", timeout=10)
+                failure_reported = True
+        return failure_reported
+
+    def on_unmount(self) -> None:
+        """Never leave stress processes running after the tuner exits."""
+        for process in self.stress_processes.values():
+            if process.poll() is None:
+                self.stop_stress(process)
+
+    @staticmethod
+    def stop_stress(process: subprocess.Popen[str]) -> None:
+        """Stop a launcher and every worker it created in its own process group."""
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
     def on_select_changed(self, event: Select.Changed) -> None:
         key = event.select.id
         if key in self.options and isinstance(event.value, str) and self.options[key] != event.value:
             self.options[key] = event.value
+            if key == 'intel-mode' and event.value == 'undervolt':
+                live_values = intel_controls.live_control_values()
+                for row in self.query(ValueRow):
+                    if row.setting.key in live_values and row.setting.value is None:
+                        row.setting.value = live_values[row.setting.key]
+                        row.setting.unavailable_reason = None
+                        row.refresh_value()
             write_last_values(self.settings, options=self.options)
             self.last_change = datetime.now()
         for row in self.query(ValueRow):
             if row.setting.key.startswith('intel-'):
-                row.disabled = self.options['intel-mode'] != 'apply'
+                row.disabled = self.options['intel-mode'] == 'keep'
             elif row.setting.key.startswith("lenovo-"):
                 row.disabled = self.options['profile'] != 'custom'
             elif row.setting.key.startswith("nvidia-core-clock"):
@@ -694,7 +779,21 @@ class TunnerApp(App[None]):
         self.query_one(StatusRail).refresh_status(self.settings, read_telemetry())
 
     def refresh_activity(self) -> None:
+        if self.refresh_stress_processes():
+            return
         activity = self.query_one("#activity", Static)
+        if self.last_apply is not None and (
+            self.last_change is None or self.last_apply >= self.last_change
+        ):
+            age = datetime.now() - self.last_apply
+            activity.styles.color = "#6ee7a8"
+            if age < timedelta(seconds=5):
+                activity.update("● Applied successfully just now — saved to last-values.json")
+            else:
+                activity.update(
+                    f"● Applied successfully {int(age.total_seconds())}s ago"
+                )
+            return
         if self.last_change is None:
             activity.styles.color = "#8e949f"
             activity.update("○ No preview change in this session")
@@ -711,7 +810,7 @@ class TunnerApp(App[None]):
         saved = load_last_values()
         try:
             options = json.loads(LAST_VALUES.read_text()).get('options', {})
-            for key, allowed in {'intel-mode': ['keep', 'apply'], 'profile': self.profiles, 'turbo': ['on', 'off'], 'core-mode': ['keep', 'auto', 'locked'], 'memory-mode': ['keep', 'auto', 'locked']}.items():
+            for key, allowed in {'intel-mode': ['keep', 'apply', 'undervolt'], 'profile': self.profiles, 'turbo': ['on', 'off'], 'core-mode': ['keep', 'auto', 'locked'], 'memory-mode': ['keep', 'auto', 'locked']}.items():
                 if options.get(key) in allowed:
                     self.query_one(f'#{key}', Select).value = options[key]
                     self.options[key] = options[key]
@@ -766,10 +865,10 @@ class TunnerApp(App[None]):
             )
             return
         write_last_values(self.settings, applied=True, options=self.options)
-        self.last_change = datetime.now()
+        self.last_change = self.last_apply = datetime.now()
         activity = self.query_one("#activity", Static)
         activity.styles.color = "#6ee7a8"
-        activity.update("● Applied just now — saved to last-values.json")
+        activity.update("● Applied successfully just now — saved to last-values.json")
         self.refresh_telemetry()
 
     def apply_commands(self) -> list[tuple[list[str], str | None]]:
@@ -779,6 +878,9 @@ class TunnerApp(App[None]):
             selected = {key: values[key] for key in intel_controls.SPECS}
             intel_controls.updated_config(intel_controls.CONFIG.read_text(), selected)
             commands.append((['sudo', '-n', sys.executable, str(Path(__file__).with_name('intel_controls.py'))], json.dumps(selected)))
+        elif self.options['intel-mode'] == 'undervolt':
+            selected = {key: values[key] for key in intel_controls.SPECS}
+            commands.append((intel_controls.python_undervolt_command(selected), None))
         def write(path, value):
             commands.append((["sudo", "-n", "tee", str(path)], f"{value}\n"))
         profile = self.options['profile']
