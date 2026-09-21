@@ -192,6 +192,14 @@ class LegionProbeTest(unittest.TestCase):
         self.assertEqual((toggles[0].unavailable_reason, toggles[0].read_failure), (None, "Status read failed"))
         self.assertEqual(toggles[0].detail, "boom")
 
+    def test_a_programming_error_in_the_reader_is_not_a_failed_read(self):
+        # Only a launch, timeout or decode problem is "Status read failed";
+        # a bug in the reader must not hide behind ten failed rows.
+        with patch("app.shutil.which", return_value=LEGION_CLI), \
+                patch("app.run_command", side_effect=TypeError("unexpected keyword argument")):
+            with self.assertRaises(TypeError):
+                probe_legion_toggles()
+
     def test_one_undecodable_reply_fails_only_that_read(self):
         # subprocess raises UnicodeDecodeError, a ValueError, for output the
         # locale cannot decode; an optional tool's oddity must not sink the
@@ -558,6 +566,12 @@ class ApplyCommandTest(unittest.TestCase):
             ["sudo", "-n", LEGION_CLI, "maximumfanspeed-disable"],
         ])
         self.assertEqual(plan.toggles, {"legion-fan-unlock": True, "legion-maximumfanspeed": False})
+        # The toggles run last, so what a partial Apply asked of them follows
+        # from how many commands ran.
+        self.assertEqual(plan.written_toggles(len(plan.commands)), plan.toggles)
+        self.assertEqual(plan.written_toggles(len(plan.commands) - 1), {"legion-fan-unlock": True})
+        self.assertEqual(plan.written_toggles(len(plan.commands) - 2), {})
+        self.assertEqual(plan.written_toggles(0), {})
         # The profile write comes first so a profile switch cannot undo a fan toggle.
         self.assertLess(
             next(index for index, (arguments, _) in enumerate(plan.commands) if "tee" in arguments),
@@ -592,12 +606,41 @@ class ApplyCommandTest(unittest.TestCase):
         ]
         app.options.update({"legion-batteryconservation": "on", "legion-rapid-charging": "on"})
 
-        with self.assertRaisesRegex(ValueError, "Battery conservation and Rapid charging cannot both be enabled"):
+        with self.assertRaisesRegex(ValueError, "Only one of Battery conservation and Rapid charging can be enabled"):
             app.apply_commands()
 
         # Enabling one while disabling the other is what the tool expects.
         app.options["legion-batteryconservation"] = "off"
         self.assertEqual(app.apply_commands().toggles, {"legion-batteryconservation": False, "legion-rapid-charging": True})
+
+    @patch("app.turbo_state", return_value=True)
+    def test_enabling_one_battery_mode_while_the_other_is_kept_on_is_rejected(self, _turbo):
+        # Keep promises to leave a feature alone, yet enabling rapid charging
+        # would turn conservation off behind the user's back; they are asked
+        # to choose Disable for it, so the plan and the dialog show the flip.
+        app = self.app([])
+        app.legion_cli = LEGION_CLI
+        app.legion_toggles = [
+            legion_toggle("batteryconservation", live=True),
+            legion_toggle("rapid-charging", live=False),
+        ]
+        app.options.update({"legion-batteryconservation": "keep", "legion-rapid-charging": "on"})
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "Enabling Rapid charging would turn Battery conservation off: "
+            "set Battery conservation to Disable rather than Keep current",
+        ):
+            app.apply_commands()
+
+        app.options["legion-batteryconservation"] = "off"
+        self.assertEqual(app.apply_commands().toggles, {"legion-batteryconservation": False, "legion-rapid-charging": True})
+
+        # A partner that is off, or whose state is unknown, is not in the way.
+        app.options["legion-batteryconservation"] = "keep"
+        for live in (False, None):
+            app.legion_toggles[0].live = live
+            self.assertEqual(app.apply_commands().toggles, {"legion-rapid-charging": True})
 
     @patch("app.turbo_state", return_value=True)
     def test_plan_records_only_the_previews_the_modes_write(self, _turbo):
@@ -1022,14 +1065,22 @@ class LayoutTest(unittest.IsolatedAsyncioTestCase):
     async def test_a_failed_status_read_leaves_the_row_editable(self):
         toggle = legion_toggle("fnlock", live=None)
         toggle.read_failure, toggle.detail = "Status read failed", "Error: [Errno 13] Permission denied"
+        missing = legion_toggle("touchpad", live=None, unavailable="Feature unavailable")
         with ExitStack() as stack:
-            app = headless_app(stack, legion=[toggle])
+            app = headless_app(stack, legion=[toggle, missing])
             async with app.run_test() as pilot:
                 await settle(app, pilot)
-                row = app.query_one(ToggleRow)
+                row, missing_row = app.query(ToggleRow)
                 self.assertEqual(str(row.query_one("#range", Static).render()), "Status read failed")
                 self.assertIn("Permission denied", row.query_one("#range", Static).tooltip)
                 self.assertFalse(row.query_one(Select).disabled)
+                # The unknown state is flagged, not drawn in the disabled
+                # colour a missing feature gets: this row can still be written.
+                self.assertTrue(row.query_one("#range", Static).has_class("unknown"))
+                self.assertFalse(row.query_one("#range", Static).has_class("hint"))
+                self.assertTrue(missing_row.query_one("#range", Static).has_class("hint"))
+                self.assertFalse(missing_row.query_one("#range", Static).has_class("unknown"))
+                self.assertTrue(missing_row.query_one(Select).disabled)
 
                 row.query_one(Select).value = "on"
                 await pilot.pause()
@@ -1081,6 +1132,51 @@ class LayoutTest(unittest.IsolatedAsyncioTestCase):
         writes = [call.args[0] for call in run_command.call_args_list if call.kwargs.get("access") == "write"]
         self.assertIn(["sudo", "-n", LEGION_CLI, "fan-unlock-enable"], writes)
 
+    async def test_an_apply_that_ran_nothing_does_not_reread_legion_states(self):
+        # Nothing ran, so nothing changed: ten legion_cli reads are spared.
+        toggle = legion_toggle("fan-unlock", live=True)
+        command = ["sudo", "-n", "tee", "/dev/null"]
+        with ExitStack() as stack:
+            app = headless_app(stack, legion=[toggle])
+            stack.enter_context(patch("app.run_command", side_effect=subprocess.CalledProcessError(1, command)))
+            async with app.run_test() as pilot:
+                await settle(app, pilot)
+                probe = stack.enter_context(patch("app.probe_legion_toggles"))
+                app.apply_confirmed(ApplyPlan([(command, None)]))
+                await settle(app, pilot)
+                self.assertIn("Apply failed", activity_text(app))
+                probe.assert_not_called()
+                self.assertEqual(toggle.live, True)
+
+    async def test_a_write_the_firmware_did_not_keep_is_reported_after_the_read_back(self):
+        # The read-back is checked against what the Apply asked for: a
+        # toggle that still reads the old state is called out in the log and
+        # a toast, except hybrid mode, which only changes after a reboot.
+        fan_unlock, hybrid = legion_toggle("fan-unlock", live=False), legion_toggle("hybrid-mode", live=False)
+        commands = [
+            (["sudo", "-n", LEGION_CLI, "fan-unlock-enable"], None),
+            (["sudo", "-n", LEGION_CLI, "hybrid-mode-enable"], None),
+        ]
+        with ExitStack() as stack:
+            app = headless_app(stack, legion=[fan_unlock, hybrid])
+            stack.enter_context(patch("app.run_command"))
+            notify = stack.enter_context(patch.object(app_module.App, "notify"))
+            async with app.run_test() as pilot:
+                await settle(app, pilot)
+                reread = [legion_toggle("fan-unlock", live=False), legion_toggle("hybrid-mode", live=False)]
+                stack.enter_context(patch("app.probe_legion_toggles", return_value=(LEGION_CLI, reread)))
+                app.apply_confirmed(ApplyPlan(
+                    commands, toggles={"legion-fan-unlock": True, "legion-hybrid-mode": True},
+                ))
+                await settle(app, pilot)
+                self.assertIn("Applied successfully", activity_text(app))
+                log = log_text(app)
+                self.assertIn("READBACK Fan unlock: asked on, reads off; the write did not take", log)
+                self.assertIn("READBACK Hybrid mode: asked on, reads off; it takes effect after a reboot", log)
+        toasts = [call.args[0] for call in notify.call_args_list]
+        self.assertIn("Fan unlock did not take; see the apply log", toasts)
+        self.assertFalse(any("Hybrid mode" in toast for toast in toasts))
+
     async def test_every_apply_rereads_legion_states_without_touching_typed_text(self):
         # A profile switch can reset fan state, so an Apply that ran no
         # legion_cli command still asks for the states again; the read-back
@@ -1119,6 +1215,30 @@ class LayoutTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertEqual(field.value, "3")
                 self.assertIn("live: on", str(row.query_one("#range", Static).render()))
+
+    async def test_finishing_an_apply_leaves_a_half_typed_value_alone(self):
+        # The commands run in the background, so their end lands whenever
+        # they finish; promoting the plan's values to live must mark the
+        # rows without rewriting a field that holds a value still being typed.
+        setting = clock_row(3000)
+        with ExitStack() as stack:
+            app = headless_app(stack, settings=[setting])
+            async with app.run_test() as pilot:
+                await settle(app, pilot)
+                row = app.query_one(ValueRow)
+                field = row.query_one("#value", Input)
+                field.focus()
+                await pilot.pause()
+                field.value = ""
+                await pilot.press("3")
+                await pilot.pause()
+                self.assertEqual((field.value, setting.value), ("3", None))
+
+                app.finish_apply(None, ApplyPlan(values={setting.key: 3000}))
+                await pilot.pause()
+                self.assertEqual((field.value, setting.value, setting.live), ("3", None, 3000))
+                self.assertIn("●", str(row.query_one(".setting-name", Label).render()))
+                self.assertIn("Applied successfully", activity_text(app))
 
     async def test_startup_selects_do_not_refresh_every_row_again(self):
         # Every Select posts Changed for its initial value at mount; those
@@ -1771,6 +1891,18 @@ class TelemetryFormatTest(unittest.TestCase):
         self.assertEqual(window.value, 128000)
         self.assertEqual(window.note, "Config reads 200 s; shown clamped to 128000 ms")
         self.assertIsNone(settings["intel-pl1-sustained-power"].note)
+
+    def test_intel_config_with_a_non_finite_token_is_unavailable_not_fatal(self):
+        # float() accepts "inf"; one such token must mark the Intel rows
+        # unavailable like any other malformed config, not abort the probe
+        # and blank the whole plan.
+        config = "power package inf/2 45/28\ntjoffset -10\n"
+        with patch("intel_controls.Path.read_text", return_value=config):
+            settings = intel_values()
+
+        self.assertEqual(len(settings), len(intel_controls.SPECS))
+        self.assertTrue(all(setting.value is None for setting in settings))
+        self.assertTrue(all(setting.unavailable_reason for setting in settings))
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ if __name__ == '__main__':
     sys.dont_write_bytecode = True
 
 import json
+import math
 from pathlib import Path
 import re
 import shutil
@@ -78,12 +79,22 @@ def config_readings(text):
     return readings
 
 
+def parse_readings(readings):
+    """Each control as a whole number in the app's units, from config_readings()."""
+    values = {}
+    for key, (token, unit) in readings.items():
+        number = float(token) * CONFIG_UNIT_SCALE[unit]
+        # float() accepts "inf" and "1e999", and round() of either raises
+        # OverflowError; a malformed token is a ValueError like any other.
+        if not math.isfinite(number):
+            raise ValueError(f'{key} is not a finite number in the config: {token!r}')
+        values[key] = round(number)
+    return values
+
+
 def parse_config(text):
     """Each control as a whole number in the app's units."""
-    return {
-        key: round(float(token) * CONFIG_UNIT_SCALE[unit])
-        for key, (token, unit) in config_readings(text).items()
-    }
+    return parse_readings(config_readings(text))
 
 
 def updated_config(text, values):

@@ -126,18 +126,23 @@ choice that differs from the live state is marked `●`, the **Planned limits**
 readout lists the toggles an Apply would run, and choices are saved and
 restored with the other mode selectors.
 
-States are read once at startup and again after every Apply, not polled: a
-profile switch can reset fan state, enabling rapid charging turns conservation
-off, and hybrid mode only takes effect after a reboot, so the app asks
-`legion_cli` rather than assuming a write stuck. Asking for battery
-conservation and rapid charging together is rejected before the dialog, since
-the second write would undo the first. A row whose feature the firmware or
+States are read once at startup and again after every Apply that ran at
+least one command, not polled: a profile switch can reset fan state, enabling
+rapid charging turns conservation off, and hybrid mode only takes effect after
+a reboot, so the app asks `legion_cli` rather than assuming a write stuck. The
+read-back is checked against what the Apply asked for: a toggle that still
+reads its old state gets a `READBACK` line in the apply log and a toast (for
+hybrid mode only the line, noting the reboot). Asking for battery conservation
+and rapid charging together is rejected before the dialog, since the second
+write would undo the first; so is enabling one while the other is on and left
+on Keep current, which would flip it behind your back — choose Disable for it
+instead, and the flip shows in the plan. A row whose feature the firmware or
 kernel module does not expose is disabled with the reason in place of its
 state (hover for `legion_cli`'s full output); a row whose status could not be
-read says so but stays editable, because the write runs as root and a read
-denied to the user says nothing about it. Without `legion_cli` on `PATH` the
-whole section is disabled. The **About Legion features** fold describes what
-each switch does.
+read says so in the warning colour but stays editable, because the write runs
+as root and a read denied to the user says nothing about it. Without
+`legion_cli` on `PATH` the whole section is disabled. The **About Legion
+features** fold describes what each switch does.
 
 ## Apply
 

@@ -140,6 +140,14 @@ class ConfigRewriteTest(unittest.TestCase):
             },
         )
 
+    def test_a_non_finite_token_is_a_value_error_like_any_other_bad_token(self):
+        # float() accepts "inf" and "1e999", and round() of either raises
+        # OverflowError, which no config reader expects; a startup probe
+        # that let it through would blank the whole plan.
+        for token in ("inf", "1e999", "1e308"):
+            with self.assertRaisesRegex(ValueError, "not a finite number"):
+                intel_controls.parse_config(f"power package 55/{token} 45/28\ntjoffset -10\n")
+
     def test_round_trip_keeps_blank_lines_and_other_directives(self):
         values = intel_controls.parse_config(self.CONFIG)
         self.assertEqual(

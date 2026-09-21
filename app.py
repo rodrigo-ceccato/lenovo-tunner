@@ -81,8 +81,12 @@ LEGION_FEATURES = (
     ("Hybrid mode", "hybrid-mode", "switches the GPU mode; takes effect after a reboot"),
 )
 # Features the firmware cannot hold on together: enabling one turns the
-# other off, so a plan asking for both is rejected before the dialog.
+# other off. A plan asking for both, or enabling one while the other is on
+# and left on Keep current, is rejected before the dialog.
 LEGION_EXCLUSIVE = (("batteryconservation", "rapid-charging"),)
+# Features whose write only takes effect after a reboot, so reading one
+# back right after an Apply shows the old state; that is not a failed write.
+LEGION_REBOOT_FEATURES = frozenset({"hybrid-mode"})
 LEGION_CHOICES = [("Keep current", "keep"), ("Enable", "on"), ("Disable", "off")]
 LEGION_HELP = (
     "legion_cli is LenovoLegionLinux's tool; Enable and Disable run its "
@@ -130,10 +134,19 @@ class ApplyPlan:
     # plan that fails part-way promotes what did run. A bare plan built by a
     # test may leave this shorter than `commands`.
     carried: list[dict[str, int]] = field(default_factory=list)
-    # key -> state for every legion_cli toggle a command was built from. This
-    # is the record of what was asked; a finished Apply re-reads every state
-    # rather than assuming the writes stuck.
+    # key -> state for every legion_cli toggle a command was built from, in
+    # command order. A finished Apply re-reads every state rather than
+    # assuming the writes stuck, and this says what each read should show.
     toggles: dict[str, bool] = field(default_factory=dict)
+
+    def written_toggles(self, completed: int) -> dict[str, bool]:
+        """The toggle states the first `completed` commands asked for.
+
+        The toggle commands are the plan's last ones, so a plan that failed
+        part-way reached only the first few of them, or none.
+        """
+        reached = completed - (len(self.commands) - len(self.toggles))
+        return dict(list(self.toggles.items())[:max(0, reached)])
 
 
 @dataclass
@@ -235,6 +248,13 @@ def legion_key(feature: str) -> str:
 def legion_target(choice: str) -> bool | None:
     """The state a Keep/Enable/Disable choice writes; None for Keep."""
     return {"on": True, "off": False}.get(choice)
+
+
+def name_list(names: list[str]) -> str:
+    """Names as prose: 'A', 'A and B', 'A, B and C'."""
+    if len(names) < 2:
+        return "".join(names)
+    return ", ".join(names[:-1]) + " and " + names[-1]
 
 
 @dataclass
@@ -372,9 +392,8 @@ def cpu_group_name(group: str) -> str:
 
 def intel_values() -> list[TuningValue]:
     try:
-        text = intel_controls.CONFIG.read_text()
-        values = intel_controls.parse_config(text)
-        readings = intel_controls.config_readings(text)
+        readings = intel_controls.config_readings(intel_controls.CONFIG.read_text())
+        values = intel_controls.parse_readings(readings)
     except (OSError, ValueError):
         values, readings = {}, {}
     settings = []
@@ -579,21 +598,21 @@ def nvidia_power_limit_available(settings: list[TuningValue]) -> bool:
 
 
 def read_legion_status(legion_cli: str, toggle: LegionToggle) -> None:
-    """Fill `toggle` from `legion_cli <feature>-status`; this never writes.
+    """Fill a fresh `toggle` from `legion_cli <feature>-status`; this never writes.
 
     A feature legion_cli reports missing disables the row. Any other failed
     read only leaves the state unknown: the write runs as root, so a status
     the user may not read (or that did not decode) says nothing about it.
     """
-    toggle.live = toggle.unavailable_reason = toggle.read_failure = toggle.detail = None
     try:
         result = run_command(
             [legion_cli, f"{toggle.feature}-status"], access="read",
             capture_output=True, text=True, timeout=15,
         )
-    except Exception as error:
-        # Broad on purpose: one odd reply from an optional tool must not
-        # sink the whole hardware probe, and describe_error names the type.
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        # A launch that fails, times out, or does not decode (a
+        # UnicodeDecodeError is a ValueError) fails this one read rather
+        # than the whole hardware probe; a programming error still surfaces.
         toggle.read_failure, toggle.detail = "Status read failed", describe_error(error)
         return
     lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
@@ -1068,7 +1087,10 @@ class ToggleRow(Horizontal):
         unavailable = toggle.unavailable_reason is not None
         state = self.query_one("#range", Static)
         state.update(toggle.state_text)
-        state.set_class(unavailable or toggle.live is None, "hint")
+        # Only a row that cannot be written takes the disabled colour; a
+        # state that could not be read is flagged, since the row stays live.
+        state.set_class(unavailable, "hint")
+        state.set_class(not unavailable and toggle.read_failure is not None, "unknown")
         state.tooltip = None if toggle.detail is None else Text(toggle.detail)
         self.query_one(Select).disabled = unavailable
 
@@ -1415,6 +1437,7 @@ class TunnerApp(App[None]):
     .setting-name.modified { color: $warning; }
     .range { width: 20; color: $text-muted; text-align: right; }
     .range.hint { color: $text-disabled; }
+    .range.unknown { color: $text-warning; }
     .value { width: 13; }
     .step { min-width: 5; width: 5; }
     .toggle-row .choice { width: 22; margin-left: 1; }
@@ -1857,18 +1880,29 @@ class TunnerApp(App[None]):
         )
         self.query_one("#status-strip", Static).update(self.status_strip_text())
 
+    def planned_legion_toggles(self) -> list[tuple[LegionToggle, bool]]:
+        """Every toggle the selected choices would write, with the state it gets.
+
+        This is the one statement of which toggles an Apply runs: the plan
+        builds its legion_cli commands from it and the status pane lists it.
+        A row whose status could not be read is included, since the write
+        runs as root; only a missing feature, or no legion_cli, keeps one out.
+        """
+        if self.legion_cli is None:
+            return []
+        return [
+            (toggle, target) for toggle in self.legion_toggles
+            if toggle.unavailable_reason is None
+            and (target := legion_target(self.options.get(toggle.key, "keep"))) is not None
+        ]
+
     def legion_summary(self) -> str:
         """The legion_cli writes the selected choices call for, for the status rail."""
         if not self.legion_toggles:
             return ""
         if self.legion_cli is None:
             return "Legion: legion_cli not installed"
-        planned = [
-            f"{toggle.name} {'on' if target else 'off'}"
-            for toggle in self.legion_toggles
-            if toggle.unavailable_reason is None
-            and (target := legion_target(self.options.get(toggle.key, "keep"))) is not None
-        ]
+        planned = [f"{toggle.name} {'on' if target else 'off'}" for toggle, target in self.planned_legion_toggles()]
         return "Legion: " + (", ".join(planned) if planned else "no toggles planned")
 
     def status_strip_text(self) -> str:
@@ -2081,7 +2115,7 @@ class TunnerApp(App[None]):
 
     def log_apply(self, kind: str, text: str, details: list[str] | tuple[str, ...] = ()) -> None:
         apply_log = self.query_one("#apply-log", RichLog)
-        style = "bold green" if kind == "APPLIED" else "bold red"
+        style = {"APPLIED": "bold green", "FAILED": "bold red"}.get(kind, "bold yellow")
         apply_log.write(Text.assemble((f"{kind:<8} ", style), text))
         for line in details:
             apply_log.write(f"         {line}")
@@ -2090,13 +2124,15 @@ class TunnerApp(App[None]):
         self.applying = False
         self.set_apply_controls(True)
         self.query_one("#apply-log", RichLog).scroll_visible()
-        if self.legion_cli is not None:
-            # Any Apply can move a toggle, not only one that wrote some: a
+        if self.legion_cli is not None and completed:
+            # Any command can move a toggle, not only a toggle write: a
             # profile switch can reset fan state, whatever ran before a
             # failure may have flipped one, and a write can change another
             # feature (rapid charging turns conservation off) or wait for a
-            # reboot (hybrid mode). The states are read back, not assumed.
-            self.refresh_legion_toggles()
+            # reboot (hybrid mode). The states are read back, not assumed,
+            # and checked against what the toggle writes that ran asked for.
+            # When nothing ran, nothing changed, and ten reads are spared.
+            self.refresh_legion_toggles(plan.written_toggles(completed))
         # The plan's own values become the readings: not a row's current
         # text, which may have changed while the commands ran, and not a row
         # the selected modes never wrote. After a failure only the commands
@@ -2110,8 +2146,11 @@ class TunnerApp(App[None]):
         for setting in self.settings:
             if setting.key in applied:
                 setting.live = applied[setting.key]
+        # Only the marker and range text change here; the field itself is
+        # left alone, since this lands whenever the commands happen to
+        # finish and would otherwise wipe a value being typed.
         for row in self.query(ValueRow):
-            row.refresh_value()
+            row.refresh_decorations()
         if failure is not None:
             self.show_activity(
                 f"● Apply failed: {failure}. Run 'sudo -v' in the terminal, then retry.", "error"
@@ -2126,8 +2165,13 @@ class TunnerApp(App[None]):
         self.refresh_status_rail()
 
     @work(thread=True, exclusive=True, group="legion", exit_on_error=False)
-    def refresh_legion_toggles(self) -> None:
-        """Re-read every legion_cli state off the loop."""
+    def refresh_legion_toggles(self, expected: dict[str, bool] | None = None) -> None:
+        """Re-read every legion_cli state off the loop.
+
+        `expected` names the states the Apply just asked for, by toggle key,
+        so a write the firmware did not keep is reported rather than left
+        as a marker the user has to notice.
+        """
         if not self.is_running:
             return
         worker = get_current_worker()
@@ -2135,15 +2179,18 @@ class TunnerApp(App[None]):
         if worker.is_cancelled:
             return
         try:
-            self.call_from_thread(self.apply_legion_states, legion_cli, toggles)
+            self.call_from_thread(self.apply_legion_states, legion_cli, toggles, expected)
         except RuntimeError:
             pass  # The app stopped while this read was in flight.
 
-    def apply_legion_states(self, legion_cli: str | None, toggles: list[LegionToggle]) -> None:
+    def apply_legion_states(
+        self, legion_cli: str | None, toggles: list[LegionToggle], expected: dict[str, bool] | None = None
+    ) -> None:
         if not self.is_running:
             return
         self.legion_cli = legion_cli
         fresh = {toggle.feature: toggle for toggle in toggles}
+        missed: list[str] = []
         for toggle in self.legion_toggles:
             state = fresh.get(toggle.feature)
             if state is not None:
@@ -2151,6 +2198,18 @@ class TunnerApp(App[None]):
                 toggle.unavailable_reason = state.unavailable_reason
                 toggle.read_failure = state.read_failure
                 toggle.detail = state.detail
+            asked = (expected or {}).get(toggle.key)
+            # A state that could not be read says nothing about the write.
+            if asked is None or toggle.live is None or toggle.live == asked:
+                continue
+            note = f"{toggle.name}: asked {'on' if asked else 'off'}, reads {'on' if toggle.live else 'off'}"
+            if toggle.feature in LEGION_REBOOT_FEATURES:
+                self.log_apply("READBACK", f"{note}; it takes effect after a reboot")
+            else:
+                self.log_apply("READBACK", f"{note}; the write did not take")
+                missed.append(toggle.name)
+        if missed:
+            self.notify(f"{name_list(missed)} did not take; see the apply log", severity="warning", timeout=10)
         # Only the toggle rows: this lands seconds after an Apply, and a
         # value row's refresh would replace whatever is being typed into it.
         self.refresh_toggle_rows()
@@ -2249,16 +2308,26 @@ class TunnerApp(App[None]):
                 raise ValueError('Unknown GPU clock mode')
             add(arguments, None, keys)
         # Last, once the profile is set: switching profiles can reset fan state.
-        toggles = [
-            (toggle, target) for toggle in self.legion_toggles
-            if self.legion_cli is not None and toggle.unavailable_reason is None
-            and (target := legion_target(self.options.get(toggle.key, 'keep'))) is not None
-        ]
+        toggles = self.planned_legion_toggles()
         enabled = {toggle.feature: toggle.name for toggle, target in toggles if target}
-        for pair in LEGION_EXCLUSIVE:
-            if all(feature in enabled for feature in pair):
+        # A feature that is on and left on Keep current would be turned off
+        # behind the user's back by enabling its partner; Keep promises to
+        # leave it alone, so they are asked to choose Disable for it.
+        kept_on = {
+            toggle.feature: toggle.name for toggle in self.legion_toggles
+            if toggle.live and legion_target(self.options.get(toggle.key, "keep")) is None
+        }
+        for group in LEGION_EXCLUSIVE:
+            asked = [enabled[feature] for feature in group if feature in enabled]
+            if len(asked) > 1:
                 # The second write would silently undo the first.
-                raise ValueError(' and '.join(enabled[feature] for feature in pair) + ' cannot both be enabled')
+                raise ValueError(f"Only one of {name_list(asked)} can be enabled")
+            held = [kept_on[feature] for feature in group if feature in kept_on]
+            if asked and held:
+                raise ValueError(
+                    f"Enabling {asked[0]} would turn {name_list(held)} off: "
+                    f"set {name_list(held)} to Disable rather than Keep current"
+                )
         for toggle, target in toggles:
             plan.toggles[toggle.key] = target
             subcommand = f"{toggle.feature}-{'enable' if target else 'disable'}"
