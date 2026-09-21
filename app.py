@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+from bisect import bisect_left
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from functools import partial
@@ -12,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -27,7 +30,7 @@ from textual.message import Message
 from textual.screen import ModalScreen
 from textual.timer import Timer
 from textual.validation import Number
-from textual.worker import get_current_worker
+from textual.worker import Worker, get_current_worker
 from textual.widgets import (
     Button,
     Collapsible,
@@ -60,6 +63,31 @@ PLATFORM_PROFILE = Path("/sys/firmware/acpi/platform_profile")
 CPUFREQ_ROOT = Path("/sys/devices/system/cpu/cpufreq")
 NO_TURBO = Path("/sys/devices/system/cpu/intel_pstate/no_turbo")
 NVIDIA_GPU_INDEX = "0"
+# LenovoLegionLinux's command-line tool, resolved on PATH at probe time.
+LEGION_CLI = "legion_cli"
+# Its boolean features: each has -status, -enable and -disable subcommands.
+# (name, legion_cli feature, what Enable does). Rapid charging and battery
+# conservation exclude each other; hybrid mode alone waits for a reboot.
+LEGION_FEATURES = (
+    ("Fan unlock", "fan-unlock", "lifts the firmware fan-speed ceiling"),
+    ("Maximum fan speed", "maximumfanspeed", "runs the fans at full speed"),
+    ("Lock fan controller", "lockfancontroller", "holds the fans at their current speed"),
+    ("Mini fan curve", "minifancurve", "lets the firmware idle the fans while cool"),
+    ("Battery conservation", "batteryconservation", "holds the charge near 60 %"),
+    ("Rapid charging", "rapid-charging", "charges faster and turns conservation off"),
+    ("Always-on USB charging", "always-on-usb-charging", "powers USB ports while off"),
+    ("Fn lock", "fnlock", "swaps F1–F12 with their Fn functions"),
+    ("Touchpad", "touchpad", "keeps the touchpad enabled"),
+    ("Hybrid mode", "hybrid-mode", "switches the GPU mode; takes effect after a reboot"),
+)
+LEGION_CHOICES = [("Keep current", "keep"), ("Enable", "on"), ("Disable", "off")]
+LEGION_HELP = (
+    "legion_cli is LenovoLegionLinux's tool; Enable and Disable run its "
+    "<feature>-enable or -disable subcommand as root on Apply, and Keep "
+    "leaves the feature alone. Live states are read at startup and after "
+    "an Apply, not polled.\n"
+    + "\n".join(f"{name}: {description}." for name, _, description in LEGION_FEATURES)
+)
 RANGE_PATTERN = re.compile(
     r"allowed range:\s*(?P<minimum>\d+)\s*[–-]\s*(?P<maximum>\d+)\s*(?P<unit>[^. `|]+)",
     re.IGNORECASE,
@@ -95,6 +123,13 @@ class ApplyPlan:
     # readings: not a row the modes never wrote, and not an edit typed while
     # the commands were running.
     values: dict[str, int] = field(default_factory=dict)
+    # Per command, the subset of `values` that command alone makes live, so a
+    # plan that fails part-way promotes what did run. A bare plan built by a
+    # test may leave this shorter than `commands`.
+    carried: list[dict[str, int]] = field(default_factory=list)
+    # key -> state for every legion_cli toggle a command was built from; a
+    # finished Apply re-reads these rather than assuming the write stuck.
+    toggles: dict[str, bool] = field(default_factory=dict)
 
 
 @dataclass
@@ -124,8 +159,14 @@ class TuningValue:
         if self.value is None or amount == 0:
             return
         if self.choices:
-            index = self.choices.index(self.nearest_choice(self.value))
-            self.value = self.choices[max(0, min(len(self.choices) - 1, index + amount))]
+            if self.value in self.choices:
+                index = self.choices.index(self.value) + amount
+            else:
+                # A typed value between two supported clocks steps to its
+                # neighbour on the requested side first, not past it.
+                position = bisect_left(self.choices, self.value)
+                index = position + amount - 1 if amount > 0 else position + amount
+            self.value = self.choices[max(0, min(len(self.choices) - 1, index))]
             return
         self.value = max(self.minimum, min(self.maximum, self.value + amount * self.step))
 
@@ -143,6 +184,34 @@ class TuningValue:
     @property
     def key(self) -> str:
         return re.sub(r"[^a-z0-9]+", "-", self.name.lower()).strip("-")
+
+
+@dataclass
+class LegionToggle:
+    """One boolean LenovoLegionLinux feature that legion_cli can enable or disable."""
+
+    name: str
+    feature: str
+    description: str
+    # The state legion_cli reported at startup or after the last Apply.
+    live: bool | None = None
+    unavailable_reason: str | None = None
+    # The full output behind a short reason, shown on hover.
+    detail: str | None = None
+
+    @property
+    def key(self) -> str:
+        return f"legion-{self.feature}"
+
+    def modified(self, choice: str) -> bool:
+        """Whether `choice` would write a state other than the live one."""
+        target = legion_target(choice)
+        return target is not None and target != self.live
+
+
+def legion_target(choice: str) -> bool | None:
+    """The state a Keep/Enable/Disable choice writes; None for Keep."""
+    return {"on": True, "off": False}.get(choice)
 
 
 @dataclass
@@ -243,24 +312,22 @@ def cpu_groups() -> dict[str, list[Path]]:
     """Group cpufreq policies by base frequency without assuming a CPU model.
 
     Two or more tiers are named "p", "e" (then "e2", ...) from the highest
-    base down; a uniform CPU is a single "all" group. Drivers that expose no
-    base_frequency are grouped by their rated maximum instead.
+    base down; a uniform CPU is a single "all" group. A driver that exposes
+    no base_frequency gets one "all" group too: the rated maximum is not a
+    core type (amd-pstate ranks preferred cores a step higher), so it must
+    not split a homogeneous CPU into P- and E-cores.
     """
     policies = sorted(CPUFREQ_ROOT.glob("policy*"))
-    tiers: dict[int, list[Path]] = {}
-    for attribute in ("base_frequency", "cpuinfo_max_freq"):
-        tiers = {}
-        for policy in policies:
-            try:
-                tiers.setdefault(policy_reading(policy, attribute), []).append(policy)
-            except (OSError, ValueError):
-                continue
-        if tiers:
-            break
-    if not tiers:
+    if not policies:
         return {}
-    if len(tiers) == 1:
-        return {"all": next(iter(tiers.values()))}
+    tiers: dict[int, list[Path]] = {}
+    for policy in policies:
+        try:
+            tiers.setdefault(policy_reading(policy, "base_frequency"), []).append(policy)
+        except (OSError, ValueError):
+            continue
+    if len(tiers) <= 1:
+        return {"all": policies}
     names = ["p", "e"] + [f"e{index}" for index in range(2, len(tiers))]
     return {name: tiers[base] for name, base in zip(names, sorted(tiers, reverse=True))}
 
@@ -285,10 +352,20 @@ def intel_values() -> list[TuningValue]:
         values = intel_controls.parse_config(intel_controls.CONFIG.read_text())
     except (OSError, ValueError):
         values = {}
-    return [TuningValue(key.replace('-', ' ').capitalize().replace('pl1', 'PL1').replace('pl2', 'PL2'),
-                        values.get(key), low, high, unit, step=step,
-                        unavailable_reason='Intel config unavailable or unsupported' if key not in values else None)
-            for key, (low, high, unit, step) in intel_controls.SPECS.items()]
+    settings = []
+    for key, (low, high, unit, step) in intel_controls.SPECS.items():
+        value, note = values.get(key), None
+        if value is not None and not low <= value <= high:
+            # A config holding firmware's "unlimited" (4095.875 W rounds past
+            # the spec) stays editable, shown clamped like a live reading.
+            value = max(low, min(high, value))
+            note = f'Config reads {values[key]} {unit}; shown clamped to {value}'
+        settings.append(TuningValue(
+            key.replace('-', ' ').capitalize().replace('pl1', 'PL1').replace('pl2', 'PL2'),
+            value, low, high, unit, step=step, note=note,
+            unavailable_reason='Intel config unavailable or unsupported' if key not in values else None,
+        ))
+    return settings
 
 
 def cpu_clock_values(groups: dict[str, list[Path]]) -> list[TuningValue]:
@@ -441,14 +518,19 @@ def nvidia_clock_values() -> list[TuningValue]:
         supported: tuple[int, ...],
         choices: tuple[int, ...] | None = None,
     ) -> TuningValue:
-        return TuningValue(
+        # The current clock is where the lock preview starts, but an idle GPU
+        # sits below the lowest lockable step, so it starts at the nearest one.
+        setting = TuningValue(
             name,
-            current_value,
+            max(supported[0], min(supported[-1], current_value)),
             supported[0],
             supported[-1],
             "MHz",
             choices=supported if choices is None else choices,
         )
+        if setting.choices:
+            setting.value = setting.nearest_choice(setting.value)
+        return setting
 
     return [
         clock("NVIDIA core clock minimum", graphics_current, graphics),
@@ -458,19 +540,56 @@ def nvidia_clock_values() -> list[TuningValue]:
     ]
 
 
-def nvidia_power_limit_available() -> bool:
-    """Return whether NVIDIA reports a numeric, writable-range power limit."""
+def nvidia_power_limit_available(settings: list[TuningValue]) -> bool:
+    """Whether the probed power row holds a live limit inside a sane range.
+
+    probe_documented_values already queried the limits; a row it left
+    unavailable had none, so no second nvidia-smi launch is needed.
+    """
+    power = next((setting for setting in settings if setting.key == "nvidia-power-ceiling"), None)
+    return power is not None and power.value is not None and power.unavailable_reason is None
+
+
+def legion_status(legion_cli: str, feature: str) -> tuple[bool | None, str | None, str | None]:
+    """Read one feature through `legion_cli <feature>-status`.
+
+    Returns (state, short reason it is unavailable, full output). A failed
+    read disables the toggle: a write through the same tool would fail too.
+    """
     try:
-        limits = nvidia_output(
-            [
-                "--query-gpu=power.min_limit,power.max_limit",
-                "--format=csv,noheader,nounits",
-            ]
-        ).splitlines()[0]
-        minimum, maximum = (float(value.strip()) for value in limits.split(","))
-        return minimum >= 0 and maximum >= minimum
-    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
-        return False
+        result = run_command(
+            [legion_cli, f"{feature}-status"], access="read",
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return None, "Status read failed", describe_error(error)
+    lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    # hybrid-mode prints a reboot notice before its value, so read the last line.
+    if result.returncode == 0 and lines and lines[-1] in ("True", "False"):
+        return lines[-1] == "True", None, None
+    errors = [line.strip() for line in (result.stderr or "").splitlines() if line.strip()]
+    detail = "\n".join(lines + errors) or f"exit status {result.returncode}"
+    # legion_cli's own wording when the sysfs node is absent or the module is not loaded.
+    if any("not available" in line for line in lines):
+        return None, "Feature unavailable", detail
+    return None, "Status read failed", detail
+
+
+def probe_legion_toggles() -> tuple[str | None, list[LegionToggle]]:
+    """Resolve legion_cli and read every feature's state; this never writes."""
+    legion_cli = shutil.which(LEGION_CLI)
+    toggles = [LegionToggle(name, feature, description) for name, feature, description in LEGION_FEATURES]
+    if legion_cli is None:
+        for toggle in toggles:
+            toggle.unavailable_reason = "legion_cli not installed"
+        return None, toggles
+    # Each status is a separate Python process; reading them side by side
+    # keeps the startup probe short.
+    with ThreadPoolExecutor(max_workers=max(1, len(toggles))) as pool:
+        states = list(pool.map(lambda toggle: legion_status(legion_cli, toggle.feature), toggles))
+    for toggle, (live, reason, detail) in zip(toggles, states):
+        toggle.live, toggle.unavailable_reason, toggle.detail = live, reason, detail
+    return legion_cli, toggles
 
 
 def sudo_ready() -> bool:
@@ -514,15 +633,28 @@ def cpu_temperature_from_sensors(report: object) -> float | None:
     return next((found[term] for term in terms if term in found), None)
 
 
-def describe_cpu_policies(groups: dict[str, list[Path]]) -> tuple[str, str, int | None]:
-    """Return (live policy ranges per group, rated boost per group, average MHz)."""
-    lines, boosts, currents = [], [], []
+def cpu_boost_text(groups: dict[str, list[Path]]) -> str:
+    """The rated boost per group; fixed, so the probe reads it once."""
+    boosts = []
+    for group, policies in groups.items():
+        try:
+            rated = max(policy_reading(policy, "cpuinfo_max_freq") for policy in policies)
+        except (OSError, ValueError):
+            continue
+        boosts.append(f"{cpu_group_name(group)}: up to {rated}")
+    if not boosts:
+        return "Rated boost unavailable"
+    return "Rated boost (not a live limit)\n" + " · ".join(boosts) + " MHz"
+
+
+def describe_cpu_policies(groups: dict[str, list[Path]]) -> tuple[str, int | None]:
+    """Return (live policy ranges per group, average MHz)."""
+    lines, currents = [], []
     for group, policies in groups.items():
         try:
             floors = [policy_reading(policy, "scaling_min_freq") for policy in policies]
             ceilings = [policy_reading(policy, "scaling_max_freq") for policy in policies]
             now = [policy_reading(policy, "scaling_cur_freq") for policy in policies]
-            rated = max(policy_reading(policy, "cpuinfo_max_freq") for policy in policies)
         except (OSError, ValueError):
             continue
         currents += now
@@ -530,15 +662,9 @@ def describe_cpu_policies(groups: dict[str, list[Path]]) -> tuple[str, str, int 
         lines.append(
             f"{label}: {max(floors)}–{min(ceilings)} MHz\n  Now {sum(now) / len(now):.0f} MHz avg"
         )
-        boosts.append(f"{cpu_group_name(group)}: up to {rated}")
     policies_text = "\n".join(lines) or "Policy readings unavailable"
-    boost_text = (
-        "Rated boost (not a live limit)\n" + " · ".join(boosts) + " MHz"
-        if boosts
-        else "Rated boost unavailable"
-    )
     average = round(sum(currents) / len(currents)) if currents else None
-    return policies_text, boost_text, average
+    return policies_text, average
 
 
 def read_telemetry(groups: dict[str, list[Path]]) -> Telemetry:
@@ -589,7 +715,7 @@ def read_telemetry(groups: dict[str, list[Path]]) -> Telemetry:
 
     telemetry.turbo_enabled = turbo_state()
     telemetry.profile = live_profile()
-    telemetry.cpu_policies, telemetry.cpu_boost, telemetry.cpu_clock = describe_cpu_policies(groups)
+    telemetry.cpu_policies, telemetry.cpu_clock = describe_cpu_policies(groups)
     telemetry.intel_limits = intel_controls.live_limits()
     return telemetry
 
@@ -633,12 +759,16 @@ class Probe:
 
     settings: list[TuningValue]
     cpu_groups: dict[str, list[Path]]
+    cpu_boost: str
     nvidia_power_limit_available: bool
     profiles: list[str]
     profile: str
     turbo: bool | None
     # None when the check never ran, so no notice claims that sudo failed.
     sudo_ready: bool | None
+    # The resolved legion_cli path, or None when it is not installed.
+    legion_cli: str | None
+    legion_toggles: list[LegionToggle]
 
 
 def probe_system() -> Probe:
@@ -656,8 +786,10 @@ def probe_system() -> Probe:
         profiles = []
     if profile is None or not profiles:
         profiles, profile = [], "unavailable"
+    legion_cli, legion_toggles = probe_legion_toggles()
     return Probe(
-        settings, groups, nvidia_power_limit_available(), profiles, profile, turbo_state(), sudo_ready()
+        settings, groups, cpu_boost_text(groups), nvidia_power_limit_available(settings),
+        profiles, profile, turbo_state(), sudo_ready(), legion_cli, legion_toggles,
     )
 
 
@@ -682,14 +814,18 @@ def gate_hint(key: str, options: dict[str, str], nvidia_power_available: bool) -
 
 
 class NumberInput(Input):
-    """An Input that only swallows the characters it can accept.
+    """An Input that lets a few harmless shortcuts through while it has focus.
 
-    Letters fall through to the app's key bindings, so `a` still applies and
-    `t` still toggles the status pane while a value field has focus.
+    `a` (Apply, which confirms first), `t` (status pane) and `l` (log) still
+    reach the app's bindings from a value field. Every other letter is
+    swallowed: a stray `q` must not quit, `r` restore, `c`/`g` launch a
+    workload or `v` discard every edit while someone is typing a number.
     """
 
+    PASSTHROUGH_KEYS = frozenset("atl")
+
     def check_consume_key(self, key: str, character: str | None) -> bool:
-        return character is not None and (character.isdigit() or character == "-")
+        return character is not None and character not in self.PASSTHROUGH_KEYS
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         # A one-line field has nothing to scroll; dropping the inherited
@@ -753,6 +889,10 @@ class ValueRow(Horizontal):
     def input_disabled(self) -> bool:
         return self.setting.value is None and self.setting.unavailable_reason is not None
 
+    @property
+    def expected_text(self) -> str:
+        return "" if self.setting.value is None else str(self.setting.value)
+
     def on_mount(self) -> None:
         self.refresh_value()
 
@@ -768,8 +908,12 @@ class ValueRow(Horizontal):
         self.post_message(self.Changed(self))
 
     def revert(self) -> bool:
-        """Put the preview back to its live reading; False when there is none."""
-        if self.disabled or not self.setting.modified or self.setting.live is None:
+        """Put the preview back to its live reading; False when there is none.
+
+        A mode gate disables the field, not the data: an edit made while the
+        section was enabled is still an edit, so Revert discards it too.
+        """
+        if not self.setting.modified or self.setting.live is None:
             return False
         self.setting.value = self.setting.live
         self.refresh_value()
@@ -790,6 +934,11 @@ class ValueRow(Horizontal):
             self.action_step(-1)
 
     def on_input_changed(self, event: Input.Changed) -> None:
+        if event.value == self.expected_text:
+            # Input posts Changed for its initial text at mount. Text that
+            # already matches the setting is not an edit: it must not blank
+            # a live reading outside the range, mark the row, or save.
+            return
         if event.validation_result is None or not event.validation_result.is_valid:
             if self.setting.value is not None:
                 self.setting.value = None
@@ -821,7 +970,7 @@ class ValueRow(Horizontal):
         self.range_validator.minimum = self.setting.minimum
         self.range_validator.maximum = self.setting.maximum
         value.disabled = self.input_disabled
-        expected = "" if self.setting.value is None else str(self.setting.value)
+        expected = self.expected_text
         if value.value != expected:
             # A programmatic sync must not be validated as user input:
             # that would re-check it against stale bounds and clear it.
@@ -848,6 +997,47 @@ class ValueRow(Horizontal):
     def refresh_buttons(self) -> None:
         self.query_one("#down", Button).disabled = not self.setting.can_change(-1)
         self.query_one("#up", Button).disabled = not self.setting.can_change(1)
+
+
+class ToggleRow(Horizontal):
+    """One legion_cli feature: its live state beside a Keep/Enable/Disable choice."""
+
+    def __init__(self, toggle: LegionToggle, choice: str) -> None:
+        super().__init__(classes="value-row toggle-row")
+        self.toggle = toggle
+        self.choice = choice
+
+    def compose(self) -> ComposeResult:
+        yield Label("", classes="setting-name")
+        yield Static("", id="range", classes="range")
+        yield Select(
+            LEGION_CHOICES, value=self.choice, allow_blank=False,
+            id=self.toggle.key, classes="choice", compact=True,
+        )
+
+    def on_mount(self) -> None:
+        self.refresh_state()
+
+    def refresh_state(self, choice: str | None = None) -> None:
+        """Update the edited marker, the live state or reason, and the selector."""
+        if choice is not None:
+            self.choice = choice
+        toggle = self.toggle
+        modified = toggle.modified(self.choice)
+        name = self.query_one(".setting-name", Label)
+        name.update(f"{'●' if modified else ' '} {toggle.name}")
+        name.set_class(modified, "modified")
+        name.tooltip = f"Enable {toggle.description}"
+        unavailable = toggle.unavailable_reason is not None
+        state = self.query_one("#range", Static)
+        state.update(
+            toggle.unavailable_reason if unavailable
+            else "live: unknown" if toggle.live is None
+            else f"live: {'on' if toggle.live else 'off'}"
+        )
+        state.set_class(unavailable, "hint")
+        state.tooltip = None if toggle.detail is None else Text(toggle.detail)
+        self.query_one(Select).disabled = unavailable
 
 
 class StatusRail(VerticalScroll):
@@ -879,6 +1069,7 @@ class StatusRail(VerticalScroll):
         gate: Callable[[str], str | None],
         telemetry: Telemetry,
         history: dict[str, deque[float]],
+        legion: str = "",
     ) -> None:
         by_key = {setting.key: setting for setting in settings}
 
@@ -995,6 +1186,8 @@ class StatusRail(VerticalScroll):
         )
         limits += plan_lines("Lenovo CPU/GPU targets", ("lenovo-cpu-temperature-target", "lenovo-gpu-temperature-target"), "°C", "/")
         limits.append("Firmware targets require Custom")
+        if legion:
+            limits.append(legion)
         self.query_one("#limit-readout", Static).update("\n".join(limits))
 
 
@@ -1006,6 +1199,7 @@ class TuningPlan(VerticalScroll):
         settings: list[TuningValue],
         profiles: list[str],
         options: dict[str, str],
+        legion_toggles: Iterable[LegionToggle] = (),
         *,
         turbo_available: bool,
     ) -> None:
@@ -1013,6 +1207,7 @@ class TuningPlan(VerticalScroll):
         self.settings = settings
         self.profiles = profiles
         self.options = options
+        self.legion_toggles = list(legion_toggles)
         self.turbo_available = turbo_available
 
     def rows(self, prefix: str) -> list[ValueRow]:
@@ -1057,6 +1252,14 @@ class TuningPlan(VerticalScroll):
             disabled=not self.profiles, compact=True,
         )
         yield from self.rows("lenovo-")
+
+        if self.legion_toggles:
+            yield Static("LEGION FEATURES · legion_cli", classes="group-title")
+            yield Label("Toggles · Enable/Disable run legion_cli on Apply; Keep leaves it alone", classes="control-label")
+            with Collapsible(title="About Legion features", collapsed=True):
+                yield Static(LEGION_HELP)
+            for toggle in self.legion_toggles:
+                yield ToggleRow(toggle, self.options.get(toggle.key, "keep"))
 
         yield Static("NVIDIA GPU", classes="group-title")
         for domain in ("core", "memory"):
@@ -1181,6 +1384,7 @@ class TunnerApp(App[None]):
     .range.hint { color: $text-disabled; }
     .value { width: 13; }
     .step { min-width: 5; width: 5; }
+    .toggle-row .choice { width: 22; margin-left: 1; }
     #workloads, #actions { height: auto; margin-top: 1; }
     #workloads Button, #actions Button { margin-right: 1; }
     #apply-log-title { color: $primary; text-style: bold; margin-top: 1; }
@@ -1223,10 +1427,14 @@ class TunnerApp(App[None]):
         super().__init__()
         self.settings: list[TuningValue] = []
         self.cpu_groups: dict[str, list[Path]] = {}
+        self.cpu_boost = "Rated boost unavailable"
         self.nvidia_power_limit_available = False
         self.profiles: list[str] = []
         self.options = {"profile": "unavailable", "turbo": "off",
-                        "core-mode": "keep", "memory-mode": "keep", "intel-mode": "keep"}
+                        "core-mode": "keep", "memory-mode": "keep", "intel-mode": "keep",
+                        **{f"legion-{feature}": "keep" for _, feature, _ in LEGION_FEATURES}}
+        self.legion_cli: str | None = None
+        self.legion_toggles: list[LegionToggle] = []
         self.plan: TuningPlan | None = None
         self.stress_processes: dict[str, subprocess.Popen[str]] = {}
         self.last_change: datetime | None = None
@@ -1241,6 +1449,7 @@ class TunnerApp(App[None]):
         }
         self.applying = False
         self.save_timer: Timer | None = None
+        self.telemetry_worker: Worker[None] | None = None
         # Wide terminals: the pane can be hidden. Narrow ones: it can replace
         # the plan instead of disappearing.
         self.rail_visible = True
@@ -1267,7 +1476,7 @@ class TunnerApp(App[None]):
         except Exception as error:
             # Nothing was read, sudo included, so the plan starts empty and
             # the notice must not claim that sudo failed.
-            probe = Probe([], {}, False, [], "unavailable", None, None)
+            probe = Probe([], {}, "Rated boost unavailable", False, [], "unavailable", None, None, None, [])
             failure = describe_error(error)
         try:
             await self.finish_probe(probe)
@@ -1277,7 +1486,7 @@ class TunnerApp(App[None]):
             failure = describe_error(error)
             await self.query("#loading").remove()
             await self.query_one("#workspace").mount(
-                Static(f"Could not build the plan: {failure}\nPress q to quit.", id="probe-failure"),
+                Static(Text(f"Could not build the plan: {failure}\nPress q to quit."), id="probe-failure"),
                 before=self.query_one(StatusRail),
             )
         if failure is None:
@@ -1289,12 +1498,18 @@ class TunnerApp(App[None]):
     async def finish_probe(self, probe: Probe) -> None:
         self.settings = probe.settings
         self.cpu_groups = probe.cpu_groups
+        self.cpu_boost = probe.cpu_boost
         self.nvidia_power_limit_available = probe.nvidia_power_limit_available
         self.profiles = probe.profiles
         self.options["profile"] = probe.profile
         self.options["turbo"] = "on" if probe.turbo else "off"
+        self.legion_cli = probe.legion_cli
+        self.legion_toggles = probe.legion_toggles
         await self.query_one("#loading").remove()
-        plan = TuningPlan(self.settings, self.profiles, self.options, turbo_available=probe.turbo is not None)
+        plan = TuningPlan(
+            self.settings, self.profiles, self.options, self.legion_toggles,
+            turbo_available=probe.turbo is not None,
+        )
         await self.query_one("#workspace").mount(plan, before=self.query_one(StatusRail))
         self.plan = plan
         self.update_sudo_notice(probe.sudo_ready)
@@ -1366,7 +1581,19 @@ class TunnerApp(App[None]):
         if self.save_timer is not None:
             self.save_timer.stop()
             self.save_timer = None
-        write_last_values(self.settings, options=self.options)
+        self.save_last_values()
+
+    def save_last_values(self, applied: bool = False) -> bool:
+        """Write last-values.json; a failure is shown, since the hardware is unaffected."""
+        try:
+            write_last_values(self.settings, applied=applied, options=self.options)
+        except OSError as error:
+            if self.is_running:
+                message = f"Could not save {LAST_VALUES.name}: {error}"
+                self.show_activity(f"● {message}", "error")
+                self.notify(message, severity="error", timeout=10)
+            return False
+        return True
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
@@ -1492,10 +1719,11 @@ class TunnerApp(App[None]):
         """Disable rows their mode selector does not apply, and say why."""
         for row in self.query(ValueRow):
             key = row.setting.key
-            unavailable = row.setting.value is None and row.setting.unavailable_reason is not None
             row.hint = self.gate(key)
-            row.disabled = row.hint is not None or (key.startswith("nvidia-memory-clock") and unavailable)
+            row.disabled = row.hint is not None or (key.startswith("nvidia-memory-clock") and row.input_disabled)
             row.refresh_value()
+        for row in self.query(ToggleRow):
+            row.refresh_state(self.options.get(row.toggle.key, "keep"))
 
     def on_select_changed(self, event: Select.Changed) -> None:
         key = event.select.id
@@ -1505,6 +1733,7 @@ class TunnerApp(App[None]):
                 self.populate_live_intel_values()
             self.last_change = datetime.now()
             self.schedule_save()
+            self.refresh_activity()
         self.update_row_disabled_state()
         self.refresh_status_rail()
 
@@ -1538,19 +1767,32 @@ class TunnerApp(App[None]):
         activity = self.query_one("#activity", Static)
         for name in TONES:
             activity.set_class(name == tone, name)
-        activity.update(text)
+        # Command output ends up here; `[E]` in it is text, not a markup tag.
+        activity.update(Text(text))
 
-    @work(thread=True, exclusive=True, group="telemetry", exit_on_error=False)
+    def notify(self, message: str, **kwargs) -> None:  # type: ignore[override]
+        # Toasts carry command output too; show it verbatim.
+        kwargs.setdefault("markup", False)
+        super().notify(message, **kwargs)
+
     def refresh_telemetry(self) -> None:
-        """Poll sensors off the event loop so a slow driver never freezes input."""
+        """Start a poll unless the previous one is still running.
+
+        A thread cannot be stopped, and cancelling a slow poll on every tick
+        would mean no sample ever lands; skipping the tick instead just lowers
+        the rate to whatever the driver manages.
+        """
         if not self.is_running:
             return
-        worker = get_current_worker()
-        telemetry = read_telemetry(self.cpu_groups)
-        # A thread cannot be stopped, only superseded: a poll that outlived
-        # the next tick must not overwrite that tick's fresher sample.
-        if worker.is_cancelled:
+        worker = self.telemetry_worker
+        if worker is not None and worker.is_running:
             return
+        self.telemetry_worker = self.poll_telemetry()
+
+    @work(thread=True, group="telemetry", exit_on_error=False)
+    def poll_telemetry(self) -> None:
+        """Read sensors off the event loop so a slow driver never freezes input."""
+        telemetry = read_telemetry(self.cpu_groups)
         try:
             self.call_from_thread(self.apply_telemetry, telemetry)
         except RuntimeError:
@@ -1559,6 +1801,7 @@ class TunnerApp(App[None]):
     def apply_telemetry(self, telemetry: Telemetry) -> None:
         if not self.is_running:
             return
+        telemetry.cpu_boost = self.cpu_boost
         self.telemetry = telemetry
         for name, trend in self.history.items():
             reading = getattr(telemetry, name)
@@ -1569,8 +1812,24 @@ class TunnerApp(App[None]):
     def refresh_status_rail(self) -> None:
         if not self.is_running:
             return  # Shutdown prunes the screen before it stops the timers.
-        self.query_one(StatusRail).refresh_status(self.settings, self.gate, self.telemetry, self.history)
+        self.query_one(StatusRail).refresh_status(
+            self.settings, self.gate, self.telemetry, self.history, self.legion_summary()
+        )
         self.query_one("#status-strip", Static).update(self.status_strip_text())
+
+    def legion_summary(self) -> str:
+        """The legion_cli writes the selected choices call for, for the status rail."""
+        if not self.legion_toggles:
+            return ""
+        if self.legion_cli is None:
+            return "Legion: legion_cli not installed"
+        planned = [
+            f"{toggle.name} {'on' if target else 'off'}"
+            for toggle in self.legion_toggles
+            if toggle.unavailable_reason is None
+            and (target := legion_target(self.options.get(toggle.key, "keep"))) is not None
+        ]
+        return "Legion: " + (", ".join(planned) if planned else "no toggles planned")
 
     def status_strip_text(self) -> str:
         """The live essentials for when the status pane is hidden: one line."""
@@ -1633,7 +1892,10 @@ class TunnerApp(App[None]):
 
     def restore_saved(self) -> None:
         if self.save_timer is not None:
-            self.flush_save()
+            # A save still pending holds the edits Restore is about to
+            # replace; writing it first would make Restore load those.
+            self.save_timer.stop()
+            self.save_timer = None
         saved, options = load_saved_state()
         allowed = {
             "intel-mode": ["keep", "apply", "undervolt"],
@@ -1642,6 +1904,8 @@ class TunnerApp(App[None]):
             "core-mode": ["keep", "auto", "locked"],
             "memory-mode": ["keep", "auto", "locked"],
         }
+        for toggle in self.legion_toggles:
+            allowed[toggle.key] = [choice for _, choice in LEGION_CHOICES]
         for key, choices in allowed.items():
             if options.get(key) in choices:
                 self.query_one(f"#{key}", Select).value = options[key]
@@ -1732,6 +1996,7 @@ class TunnerApp(App[None]):
     def run_apply(self, plan: ApplyPlan) -> None:
         """Run the confirmed plan off the event loop, reporting each command."""
         failure: str | None = None
+        completed = 0
         try:
             for arguments, input_text in plan.commands:
                 rendered = render_command(arguments, input_text)
@@ -1760,12 +2025,13 @@ class TunnerApp(App[None]):
                     if line.strip() and line.strip() != echoed
                 ]
                 self.call_from_thread(self.log_apply, "APPLIED", rendered, details)
+                completed += 1
         except Exception as error:
             # Anything unexpected must land in the log rather than tear down
             # the app mid-apply.
             failure = describe_error(error)
             self.call_from_thread(self.log_apply, "FAILED", f"Apply aborted: {failure}")
-        self.call_from_thread(self.finish_apply, failure, plan.values)
+        self.call_from_thread(self.finish_apply, failure, plan, completed)
 
     def begin_apply(self) -> None:
         self.applying = True
@@ -1780,29 +2046,70 @@ class TunnerApp(App[None]):
         for line in details:
             apply_log.write(f"         {line}")
 
-    def finish_apply(self, failure: str | None, applied: dict[str, int]) -> None:
+    def finish_apply(self, failure: str | None, plan: ApplyPlan, completed: int = 0) -> None:
         self.applying = False
         self.set_apply_controls(True)
         self.query_one("#apply-log", RichLog).scroll_visible()
+        if plan.toggles:
+            # Whatever ran before a failure may have flipped a toggle, and a
+            # write can change another feature (rapid charging turns
+            # conservation off) or wait for a reboot (hybrid mode), so the
+            # states are read back rather than assumed.
+            self.refresh_legion_toggles()
+        # The plan's own values become the readings: not a row's current
+        # text, which may have changed while the commands ran, and not a row
+        # the selected modes never wrote. After a failure only the commands
+        # that ran changed hardware, so only what they carried is promoted.
+        if failure is None:
+            applied = plan.values
+        else:
+            applied = {}
+            for carried in plan.carried[:completed]:
+                applied.update(carried)
+        for setting in self.settings:
+            if setting.key in applied:
+                setting.live = applied[setting.key]
+        for row in self.query(ValueRow):
+            row.refresh_value()
         if failure is not None:
             self.show_activity(
                 f"● Apply failed: {failure}. Run 'sudo -v' in the terminal, then retry.", "error"
             )
             self.notify(f"Apply failed: {failure}", severity="error", timeout=10)
         else:
-            # The plan's own values become the readings: not a row's current
-            # text, which may have changed while the commands ran, and not a
-            # row the selected modes never wrote.
-            for setting in self.settings:
-                if setting.key in applied:
-                    setting.live = applied[setting.key]
-            for row in self.query(ValueRow):
-                row.refresh_value()
-            write_last_values(self.settings, applied=True, options=self.options)
             self.last_change = self.last_apply = datetime.now()
-            self.refresh_activity()
+            if self.save_last_values(applied=True):
+                self.refresh_activity()
             self.notify("Applied to hardware", timeout=5)
         self.refresh_telemetry()
+        self.refresh_status_rail()
+
+    @work(thread=True, exclusive=True, group="legion", exit_on_error=False)
+    def refresh_legion_toggles(self) -> None:
+        """Re-read every legion_cli state off the loop."""
+        if not self.is_running:
+            return
+        worker = get_current_worker()
+        legion_cli, toggles = probe_legion_toggles()
+        if worker.is_cancelled:
+            return
+        try:
+            self.call_from_thread(self.apply_legion_states, legion_cli, toggles)
+        except RuntimeError:
+            pass  # The app stopped while this read was in flight.
+
+    def apply_legion_states(self, legion_cli: str | None, toggles: list[LegionToggle]) -> None:
+        if not self.is_running:
+            return
+        self.legion_cli = legion_cli
+        fresh = {toggle.feature: toggle for toggle in toggles}
+        for toggle in self.legion_toggles:
+            state = fresh.get(toggle.feature)
+            if state is not None:
+                toggle.live = state.live
+                toggle.unavailable_reason = state.unavailable_reason
+                toggle.detail = state.detail
+        self.update_row_disabled_state()
         self.refresh_status_rail()
 
     def apply_commands(self) -> ApplyPlan:
@@ -1819,18 +2126,23 @@ class TunnerApp(App[None]):
                 plan.values[key] = value
             return value
 
-        commands = plan.commands
+        def add(arguments: list[str], input_text: str | None = None, keys: tuple[str, ...] = ()) -> None:
+            """Queue a command with the planned keys a successful run makes live."""
+            plan.commands.append((arguments, input_text))
+            plan.carried.append({key: plan.values[key] for key in keys})
+
+        def write(path, value, keys: tuple[str, ...] = ()) -> None:
+            add(["sudo", "-n", "tee", str(path)], f"{value}\n", keys)
+
         intel_mode = self.options['intel-mode']
         if intel_mode in ('apply', 'undervolt'):
             selected = {key: planned(key) for key in intel_controls.SPECS}
+            intel_keys = tuple(key for key, value in selected.items() if value is not None)
             if intel_mode == 'apply':
                 intel_controls.updated_config(intel_controls.CONFIG.read_text(), selected)
-                commands.append((['sudo', '-n', sys.executable, str(Path(__file__).with_name('intel_controls.py'))], json.dumps(selected)))
+                add(['sudo', '-n', sys.executable, str(Path(__file__).with_name('intel_controls.py'))], json.dumps(selected), intel_keys)
             else:
-                commands.append((intel_controls.python_undervolt_command(selected), None))
-
-        def write(path, value):
-            commands.append((["sudo", "-n", "tee", str(path)], f"{value}\n"))
+                add(intel_controls.python_undervolt_command(selected), None, intel_keys)
 
         profile = self.options['profile']
         if profile not in self.profiles:
@@ -1841,11 +2153,12 @@ class TunnerApp(App[None]):
                 value = planned(key)
                 if value is None:
                     raise ValueError(f'{key} unavailable')
-                write(LENOVO_ATTRIBUTE_ROOT / attribute / 'current_value', value)
-        if turbo_state() is None:
-            raise ValueError('Turbo state unavailable')
-        turbo = self.options['turbo'] == 'on'
-        write(NO_TURBO, 0 if turbo else 1)
+                write(LENOVO_ATTRIBUTE_ROOT / attribute / 'current_value', value, (key,))
+        # Without intel_pstate there is no Turbo switch to write and nothing
+        # caps a ceiling at base, so the driver's rated maximum is the limit.
+        turbo = None if turbo_state() is None else self.options['turbo'] == 'on'
+        if turbo is not None:
+            write(NO_TURBO, 0 if turbo else 1)
         for group, policies in self.cpu_groups.items():
             name = cpu_group_name(group)
             low = planned(f'cpu-{group}-core-minimum-frequency')
@@ -1857,36 +2170,48 @@ class TunnerApp(App[None]):
             except (OSError, ValueError) as error:
                 raise ValueError(f'{name}-core driver limits unavailable: {error}') from error
             # With Turbo off the kernel caps at base, so a higher ceiling is a lie.
-            maximum = ceiling if turbo or base is None else base
+            maximum = base if turbo is False and base is not None else ceiling
             if low < floor or high > maximum:
                 raise ValueError(
                     f'{name}-core range must stay within {floor}–{maximum} MHz with Turbo {self.options["turbo"]}'
                 )
-            for policy in policies:
+            range_keys = (f'cpu-{group}-core-minimum-frequency', f'cpu-{group}-core-maximum-frequency')
+            for index, policy in enumerate(policies):
                 # Lower the floor first so lowering a ceiling never crosses it.
                 write(policy / 'scaling_min_freq', floor * 1000)
                 write(policy / 'scaling_max_freq', high * 1000)
-                write(policy / 'scaling_min_freq', low * 1000)
+                # The group's range is live once its last policy holds it.
+                write(policy / 'scaling_min_freq', low * 1000, range_keys if index == len(policies) - 1 else ())
         if self.nvidia_power_limit_available:
             power_limit = planned('nvidia-power-ceiling')
             if power_limit is None:
                 raise ValueError('NVIDIA power limit unavailable')
-            commands.append((["sudo", "-n", "nvidia-smi", "-i", NVIDIA_GPU_INDEX, "-pl", str(power_limit)], None))
+            add(["sudo", "-n", "nvidia-smi", "-i", NVIDIA_GPU_INDEX, "-pl", str(power_limit)], None, ('nvidia-power-ceiling',))
         for domain, lock, reset in [('core', '-lgc', '-rgc'), ('memory', '-lmc', '-rmc')]:
             mode = self.options[f'{domain}-mode']
             if mode == 'keep':
                 continue
             arguments = ["sudo", "-n", "nvidia-smi", "-i", NVIDIA_GPU_INDEX]
+            keys: tuple[str, ...] = ()
             if mode == 'auto':
                 arguments.append(reset)
             elif mode == 'locked':
-                low, high = (planned(f'nvidia-{domain}-clock-{bound}') for bound in ('minimum', 'maximum'))
+                keys = (f'nvidia-{domain}-clock-minimum', f'nvidia-{domain}-clock-maximum')
+                low, high = (planned(key) for key in keys)
                 if low is None or high is None or low > high:
                     raise ValueError(f'GPU {domain} clock range invalid or unavailable')
                 arguments.extend([lock, f'{low},{high}'])
             else:
                 raise ValueError('Unknown GPU clock mode')
-            commands.append((arguments, None))
+            add(arguments, None, keys)
+        # Last, once the profile is set: switching profiles can reset fan state.
+        for toggle in self.legion_toggles:
+            target = legion_target(self.options.get(toggle.key, 'keep'))
+            if target is None or toggle.unavailable_reason is not None or self.legion_cli is None:
+                continue
+            plan.toggles[toggle.key] = target
+            subcommand = f"{toggle.feature}-{'enable' if target else 'disable'}"
+            add(["sudo", "-n", self.legion_cli, subcommand])
         return plan
 
 

@@ -45,3 +45,26 @@ A=/sys/class/firmware-attributes/lenovo-wmi-other-0/attributes
 Do not change `gpu_nv_ac_offset`, `gpu_nv_ctgp`, or `gpu_nv_ppab`: the
 firmware exposes no writable range for those vendor-specific attributes on
 this machine.
+
+## LenovoLegionLinux switches (`legion_cli`)
+
+These need the `legion-laptop` kernel module from
+[LenovoLegionLinux](https://github.com/johnfanv2/LenovoLegionLinux) and its
+`legion_cli`. Every switch has `<feature>-status`, `<feature>-enable`, and
+`<feature>-disable` subcommands; status reads run as the desktop user, enable
+and disable write sysfs as root. `legion_cli` prints "Command not available"
+when the firmware or module does not expose a feature.
+
+| Name | Description | Command |
+|---|---|---|
+| Fan unlock | Lifts the firmware fan-speed ceiling on supported firmwares (the EC otherwise caps fans around 4400 RPM in Performance). | `sudo legion_cli fan-unlock-enable` / `sudo legion_cli fan-unlock-disable` |
+| Maximum fan speed | Runs the fans at full speed regardless of temperature. | `sudo legion_cli maximumfanspeed-enable` / `-disable` |
+| Lock fan controller | Holds the fans at their current speed. | `sudo legion_cli lockfancontroller-enable` / `-disable` |
+| Mini fan curve | Lets the firmware idle the fans while the machine is cool. | `sudo legion_cli minifancurve-enable` / `-disable` |
+| Battery conservation | Holds the charge near 60 %; enabling it turns rapid charging off. | `sudo legion_cli batteryconservation-enable` / `-disable` |
+| Rapid charging | Charges faster; enabling it turns battery conservation off. | `sudo legion_cli rapid-charging-enable` / `-disable` |
+| Always-on USB charging | Powers the USB ports while the machine is off. | `sudo legion_cli always-on-usb-charging-enable` / `-disable` |
+| Fn lock | Swaps F1–F12 with their Fn functions. | `sudo legion_cli fnlock-enable` / `-disable` |
+| Touchpad | Enables or disables the touchpad. | `sudo legion_cli touchpad-enable` / `-disable` |
+| Hybrid mode | Switches the GPU mode; takes effect only after a reboot. | `sudo legion_cli hybrid-mode-enable` / `-disable` |
+| Read a switch | Prints `True` or `False`. | `legion_cli fan-unlock-status` |

@@ -1,5 +1,6 @@
 """Headless regression coverage for the interface, without hardware writes."""
 
+import asyncio
 from contextlib import ExitStack
 from datetime import datetime, timedelta
 import json
@@ -13,41 +14,54 @@ import unittest
 from unittest.mock import Mock, patch
 
 from textual.widgets import Button, Input, Label, RichLog, Select, Static
+from textual.worker import WorkerCancelled
 
 import app as app_module
 import intel_controls
 from app import (
     ApplyConfirmation,
     ApplyPlan,
+    LEGION_FEATURES,
     LENOVO_ATTRIBUTES,
+    LegionToggle,
     Telemetry,
+    ToggleRow,
     TunnerApp,
     TuningValue,
     ValueRow,
+    cpu_boost_text,
     cpu_clock_values,
     cpu_groups,
     cpu_temperature_from_sensors,
     describe_cpu_policies,
     intel_values,
     nvidia_clock_values,
+    nvidia_power_limit_available,
     probe_documented_values,
+    probe_legion_toggles,
     read_telemetry,
 )
 
 
 PROFILES = ["quiet", "balanced", "performance", "custom"]
+LEGION_CLI = "/usr/bin/legion_cli"
 
 
-def headless_app(stack, *, settings=(), cpu=(), nvidia=(), intel=(), saved=None,
+def headless_app(stack, *, settings=(), cpu=(), nvidia=(), intel=(), legion=(), saved=None,
                  power_available=False, sudo=True, profile="balanced", poll=False):
     """Build a TunnerApp with every hardware probe patched out.
 
     `saved`, when given, is written to a temporary last-values.json that the
     app reads from and writes to, so Restore can be exercised end to end.
     Telemetry polling is stubbed out unless `poll` is set, in which case the
-    test must patch `app.read_telemetry` itself.
+    test must patch `app.read_telemetry` itself. `legion` toggles are served
+    by a fake legion_cli at /usr/bin/legion_cli; none means it is not installed.
     """
     stack.enter_context(patch("app.load_values", return_value=list(settings)))
+    stack.enter_context(patch(
+        "app.probe_legion_toggles",
+        return_value=(LEGION_CLI if legion else None, list(legion)),
+    ))
     stack.enter_context(patch("app.cpu_groups", return_value={}))
     stack.enter_context(patch("app.cpu_clock_values", return_value=list(cpu)))
     stack.enter_context(patch("app.nvidia_clock_values", return_value=list(nvidia)))
@@ -71,9 +85,18 @@ def headless_app(stack, *, settings=(), cpu=(), nvidia=(), intel=(), saved=None,
 
 
 async def settle(app, pilot):
-    """Let the startup probe (and any apply) worker finish, then the UI catch up."""
+    """Let the startup probe (and any apply) worker finish, then the UI catch up.
+
+    An exclusive worker superseded while still running raises WorkerCancelled
+    from wait_for_complete; that is normal, so wait again for the rest.
+    """
     await pilot.pause()
-    await app.workers.wait_for_complete()
+    for _ in range(200):
+        try:
+            await app.workers.wait_for_complete()
+            break
+        except WorkerCancelled:
+            await asyncio.sleep(0.05)
     await pilot.pause()
 
 
@@ -99,6 +122,70 @@ def clock_row(value=3000, live=None):
     setting = TuningValue("CPU P-core maximum frequency", value, 800, 5400, "MHz", 100)
     setting.live = value if live is None else live
     return setting
+
+
+def legion_toggle(feature, live=False, unavailable=None):
+    name, _, description = next(entry for entry in LEGION_FEATURES if entry[1] == feature)
+    return LegionToggle(name, feature, description, live=live, unavailable_reason=unavailable)
+
+
+def legion_cli_status(feature, returncode=0, stdout="", stderr=""):
+    return subprocess.CompletedProcess([LEGION_CLI, f"{feature}-status"], returncode, stdout, stderr)
+
+
+class LegionProbeTest(unittest.TestCase):
+    def test_reads_every_feature_through_legion_cli_status(self):
+        # legion_cli prints the Python bool, a notice line first for hybrid
+        # mode, its own "not available" text for a missing sysfs node, and
+        # exits non-zero with stderr when the module cannot be reached.
+        replies = {
+            "fan-unlock": legion_cli_status("fan-unlock", stdout="True\n"),
+            "hybrid-mode": legion_cli_status("hybrid-mode", stdout="This is the current state.\nFalse\n"),
+            "batteryconservation": legion_cli_status(
+                "batteryconservation", 246,
+                stdout="Command not available because feature is not available or kernel module is not loaded.\n",
+            ),
+            "fnlock": legion_cli_status("fnlock", 1, stderr="Error: [Errno 13] Permission denied\n"),
+        }
+
+        def fake_run(arguments, *, access, **kwargs):
+            self.assertEqual(access, "read")
+            self.assertEqual(arguments[0], LEGION_CLI)
+            feature = arguments[1].removesuffix("-status")
+            self.assertNotEqual(feature, arguments[1])
+            return replies.get(feature, legion_cli_status(feature, stdout="False\n"))
+
+        with patch("app.shutil.which", return_value=LEGION_CLI), patch("app.run_command", side_effect=fake_run):
+            legion_cli, toggles = probe_legion_toggles()
+
+        self.assertEqual(legion_cli, LEGION_CLI)
+        self.assertEqual([toggle.feature for toggle in toggles], [feature for _, feature, _ in LEGION_FEATURES])
+        by_feature = {toggle.feature: toggle for toggle in toggles}
+        self.assertEqual((by_feature["fan-unlock"].live, by_feature["fan-unlock"].unavailable_reason), (True, None))
+        self.assertEqual((by_feature["hybrid-mode"].live, by_feature["hybrid-mode"].unavailable_reason), (False, None))
+        self.assertEqual(by_feature["touchpad"].live, False)
+        conservation = by_feature["batteryconservation"]
+        self.assertEqual((conservation.live, conservation.unavailable_reason), (None, "Feature unavailable"))
+        self.assertIn("kernel module", conservation.detail)
+        fnlock = by_feature["fnlock"]
+        self.assertEqual((fnlock.live, fnlock.unavailable_reason), (None, "Status read failed"))
+        self.assertIn("Permission denied", fnlock.detail)
+
+    def test_missing_legion_cli_marks_every_toggle_unavailable_without_running_anything(self):
+        with patch("app.shutil.which", return_value=None), patch("app.run_command") as run:
+            legion_cli, toggles = probe_legion_toggles()
+
+        self.assertIsNone(legion_cli)
+        self.assertEqual(len(toggles), len(LEGION_FEATURES))
+        self.assertTrue(all(toggle.unavailable_reason == "legion_cli not installed" for toggle in toggles))
+        run.assert_not_called()
+
+    def test_a_failed_launch_is_a_failed_read(self):
+        with patch("app.shutil.which", return_value=LEGION_CLI), patch("app.run_command", side_effect=OSError("boom")):
+            _, toggles = probe_legion_toggles()
+
+        self.assertEqual(toggles[0].unavailable_reason, "Status read failed")
+        self.assertEqual(toggles[0].detail, "boom")
 
 
 class LiveDocumentedValueTest(unittest.TestCase):
@@ -172,6 +259,39 @@ class NvidiaClockTest(unittest.TestCase):
         setting.value = 1300
         self.assertEqual(setting.nearest_choice(setting.value), 1200)
 
+    def test_stepping_from_a_typed_value_reaches_the_adjacent_clock_first(self):
+        setting = TuningValue("NVIDIA core clock maximum", 1300, 405, 1410, "MHz", choices=(405, 1200, 1410))
+        setting.change(-1)
+        self.assertEqual(setting.value, 1200)
+
+        setting.value = 1100
+        setting.change(1)
+        self.assertEqual(setting.value, 1200)
+
+        setting.value = 1100
+        setting.change(2)
+        self.assertEqual(setting.value, 1410)
+        setting.value = 1300
+        setting.change(-5)
+        self.assertEqual(setting.value, 405)
+
+    @patch("app.nvidia_output")
+    def test_idle_clocks_below_the_lowest_step_start_at_that_step(self, output):
+        output.side_effect = [
+            "210, 300\n",
+            "Memory : 9001 MHz\n    Graphics : 1410 MHz\nMemory : 405 MHz\n    Graphics : 405 MHz\n",
+        ]
+        settings = {setting.key: setting for setting in nvidia_clock_values()}
+        self.assertEqual(settings["nvidia-core-clock-minimum"].value, 405)
+        self.assertEqual(settings["nvidia-memory-clock-minimum"].value, 405)
+
+    def test_power_availability_comes_from_the_probed_row(self):
+        power = TuningValue("NVIDIA power ceiling", 150, 5, 175, "W")
+        self.assertTrue(nvidia_power_limit_available([power]))
+        power.value, power.unavailable_reason = None, "Live NVIDIA power limit unavailable"
+        self.assertFalse(nvidia_power_limit_available([power]))
+        self.assertFalse(nvidia_power_limit_available([]))
+
 
 class CpuGroupTest(unittest.TestCase):
     def sysfs(self, stack, bases, *, rated=None, base_files=True, floor=800):
@@ -194,7 +314,8 @@ class CpuGroupTest(unittest.TestCase):
             self.sysfs(stack, [2200, 1600, 2200, 1600], rated={2200: 5400, 1600: 3900})
             groups = cpu_groups()
             settings = {setting.key: setting for setting in cpu_clock_values(groups)}
-            policies, boost, average = describe_cpu_policies(groups)
+            policies, average = describe_cpu_policies(groups)
+            boost = cpu_boost_text(groups)
 
         self.assertEqual(sorted(groups), ["e", "p"])
         self.assertEqual(average, 1900)
@@ -229,10 +350,16 @@ class CpuGroupTest(unittest.TestCase):
             self.assertIsNone(settings[key].unavailable_reason, key)
             self.assertEqual((settings[key].minimum, settings[key].maximum), (2400, 2400))
 
-    def test_driver_without_base_frequency_groups_by_rated_maximum(self):
+    def test_driver_without_base_frequency_is_one_group_even_with_ranked_maxima(self):
+        # amd-pstate reports a slightly higher cpuinfo_max_freq on preferred
+        # cores; that is a ranking, not a core type, so no P/E split.
         with ExitStack() as stack:
-            self.sysfs(stack, [3000, 3000], base_files=False)
-            self.assertEqual(list(cpu_groups()), ["all"])
+            self.sysfs(stack, [3000, 2900], base_files=False)
+            groups = cpu_groups()
+            self.assertEqual(list(groups), ["all"])
+            self.assertEqual(len(groups["all"]), 2)
+            self.assertEqual([s.name for s in cpu_clock_values(groups)],
+                             ["CPU all-core minimum frequency", "CPU all-core maximum frequency"])
 
     def test_no_policies_means_no_groups(self):
         with ExitStack() as stack:
@@ -328,6 +455,94 @@ class ApplyCommandTest(unittest.TestCase):
         app.options["turbo"] = "off"
         with self.assertRaisesRegex(ValueError, "800–2200 MHz with Turbo off"):
             app.apply_commands()
+
+    @patch("app.cpu_group_limits", return_value=(800, 2200, 5400))
+    @patch("app.turbo_state", return_value=None)
+    def test_without_intel_pstate_the_turbo_write_is_skipped_not_fatal(self, _turbo, _limits):
+        settings = [
+            TuningValue("CPU P-core minimum frequency", 800, 800, 5400, "MHz", 100),
+            TuningValue("CPU P-core maximum frequency", 5000, 800, 5400, "MHz", 100),
+            TuningValue("NVIDIA power ceiling", 150, 5, 175, "W"),
+        ]
+        app = self.app(settings, groups={"p": [Path("/policy0")]}, power_available=True)
+        app.options["turbo"] = "off"  # the disabled selector's default
+
+        plan = app.apply_commands()
+        targets = [arguments[-1] for arguments, _ in plan.commands if "tee" in arguments]
+        self.assertNotIn(str(app_module.NO_TURBO), targets)
+        self.assertIn("/policy0/scaling_max_freq", targets)
+        self.assertTrue(any("nvidia-smi" in arguments for arguments, _ in plan.commands))
+        self.assertEqual(plan.values["cpu-p-core-maximum-frequency"], 5000)
+
+    @patch("app.cpu_group_limits", return_value=(800, 2200, 5400))
+    @patch("app.turbo_state", return_value=True)
+    def test_each_command_carries_the_previews_it_makes_live(self, _turbo, _limits):
+        settings = [TuningValue(key.replace("-", " "), 50, 1, 200, "W") for key in LENOVO_ATTRIBUTES]
+        settings += [
+            TuningValue("CPU P-core minimum frequency", 800, 800, 5400, "MHz", 100),
+            TuningValue("CPU P-core maximum frequency", 4000, 800, 5400, "MHz", 100),
+            TuningValue("NVIDIA power ceiling", 150, 5, 175, "W"),
+            TuningValue("NVIDIA core clock minimum", 405, 405, 1410, "MHz"),
+            TuningValue("NVIDIA core clock maximum", 1410, 405, 1410, "MHz"),
+        ]
+        app = self.app(settings, profile="custom", power_available=True,
+                       groups={"p": [Path("/policy0"), Path("/policy1")]})
+        app.options["core-mode"] = "locked"
+
+        plan = app.apply_commands()
+        self.assertEqual(len(plan.carried), len(plan.commands))
+        carried = {}
+        for values in plan.carried:
+            carried.update(values)
+        self.assertEqual(carried, plan.values)
+        by_command = {tuple(arguments): values for (arguments, _), values in zip(plan.commands, plan.carried)}
+        self.assertEqual(by_command[("sudo", "-n", "tee", str(app_module.PLATFORM_PROFILE))], {})
+        self.assertEqual(
+            by_command[("sudo", "-n", "tee", str(app_module.LENOVO_ATTRIBUTE_ROOT / "cpu_temp" / "current_value"))],
+            {"lenovo-cpu-temperature-target": 50},
+        )
+        self.assertEqual(by_command[("sudo", "-n", "nvidia-smi", "-i", "0", "-pl", "150")], {"nvidia-power-ceiling": 150})
+        self.assertEqual(
+            by_command[("sudo", "-n", "nvidia-smi", "-i", "0", "-lgc", "405,1410")],
+            {"nvidia-core-clock-minimum": 405, "nvidia-core-clock-maximum": 1410},
+        )
+        # A policy group is live only once its last policy holds the range.
+        cpu_writes = [values for (arguments, _), values in zip(plan.commands, plan.carried) if "/policy" in arguments[-1]]
+        self.assertEqual(cpu_writes[:-1], [{}] * (len(cpu_writes) - 1))
+        self.assertEqual(cpu_writes[-1], {"cpu-p-core-minimum-frequency": 800, "cpu-p-core-maximum-frequency": 4000})
+
+    @patch("app.turbo_state", return_value=True)
+    def test_legion_toggles_run_legion_cli_only_for_enable_or_disable(self, _turbo):
+        app = self.app([])
+        app.legion_cli = LEGION_CLI
+        app.legion_toggles = [
+            legion_toggle("fan-unlock", live=False),
+            legion_toggle("maximumfanspeed", live=True),
+            legion_toggle("touchpad", live=None, unavailable="Feature unavailable"),
+            legion_toggle("fnlock", live=False),
+        ]
+        app.options.update({
+            "legion-fan-unlock": "on",
+            "legion-maximumfanspeed": "off",
+            "legion-touchpad": "on",  # restored choice for a feature this firmware lacks
+            "legion-fnlock": "keep",
+        })
+
+        plan = app.apply_commands()
+        legion_commands = [arguments for arguments, _ in plan.commands if LEGION_CLI in arguments]
+        self.assertEqual(legion_commands, [
+            ["sudo", "-n", LEGION_CLI, "fan-unlock-enable"],
+            ["sudo", "-n", LEGION_CLI, "maximumfanspeed-disable"],
+        ])
+        self.assertEqual(plan.toggles, {"legion-fan-unlock": True, "legion-maximumfanspeed": False})
+        # The profile write comes first so a profile switch cannot undo a fan toggle.
+        self.assertLess(
+            next(index for index, (arguments, _) in enumerate(plan.commands) if "tee" in arguments),
+            next(index for index, (arguments, _) in enumerate(plan.commands) if LEGION_CLI in arguments),
+        )
+
+        app.legion_cli = None
+        self.assertEqual(app.apply_commands().toggles, {})
 
     @patch("app.turbo_state", return_value=True)
     def test_plan_records_only_the_previews_the_modes_write(self, _turbo):
@@ -606,6 +821,19 @@ class LayoutTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertNotIsInstance(app.screen, ApplyConfirmation)
 
+                # A stray letter must neither reach a destructive binding nor the field.
+                restore = stack.enter_context(patch.object(TunnerApp, "restore_saved"))
+                stress = stack.enter_context(patch.object(TunnerApp, "toggle_stress"))
+                field.focus()
+                await pilot.pause()
+                for key in ("q", "r", "c", "g", "v"):
+                    await pilot.press(key)
+                    await pilot.pause()
+                    self.assertTrue(app.is_running, key)
+                self.assertEqual(field.value, "3000")
+                restore.assert_not_called()
+                stress.assert_not_called()
+
     async def test_status_strip_appears_when_the_rail_is_hidden(self):
         with ExitStack() as stack:
             app = headless_app(stack)
@@ -668,6 +896,214 @@ class LayoutTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertFalse(row.disabled)
                 self.assertIn("30–140 W", str(row.query_one("#range", Static).render()))
+
+                # An edit made while enabled is still an edit once the gate closes.
+                row.action_step(1)
+                app.query_one("#profile", Select).value = "balanced"
+                await pilot.pause()
+                self.assertTrue(row.disabled)
+                self.assertTrue(lenovo.modified)
+                app.action_revert()
+                await pilot.pause()
+                self.assertEqual(lenovo.value, 70)
+                self.assertIn("Reverted 1 value", activity_text(app))
+
+    async def test_legion_toggle_shows_live_state_and_marks_a_planned_change(self):
+        toggles = [
+            legion_toggle("fan-unlock", live=False),
+            legion_toggle("touchpad", unavailable="Feature unavailable"),
+        ]
+        toggles[1].detail = "Command not available because feature is not available or kernel module is not loaded."
+        with ExitStack() as stack:
+            app = headless_app(stack, legion=toggles)
+            async with app.run_test() as pilot:
+                await settle(app, pilot)
+                fan_unlock, touchpad = app.query(ToggleRow).results()
+                self.assertIn("live: off", str(fan_unlock.query_one("#range", Static).render()))
+                self.assertNotIn("●", str(fan_unlock.query_one(".setting-name", Label).render()))
+                self.assertFalse(fan_unlock.query_one(Select).disabled)
+                self.assertTrue(touchpad.query_one(Select).disabled)
+                self.assertIn("Feature unavailable", str(touchpad.query_one("#range", Static).render()))
+                self.assertIn("kernel module", touchpad.query_one("#range", Static).tooltip)
+                self.assertIn("no toggles planned", str(app.query_one("#limit-readout", Static).render()))
+
+                fan_unlock.query_one(Select).value = "on"
+                await pilot.pause()
+                self.assertEqual(app.options["legion-fan-unlock"], "on")
+                self.assertIn("●", str(fan_unlock.query_one(".setting-name", Label).render()))
+                self.assertIn("Fan unlock on", str(app.query_one("#limit-readout", Static).render()))
+                self.assertIn("Changed just now", activity_text(app))
+
+                # Choosing the state the hardware already has is not an edit.
+                fan_unlock.query_one(Select).value = "off"
+                await pilot.pause()
+                self.assertNotIn("●", str(fan_unlock.query_one(".setting-name", Label).render()))
+                self.assertIn("Fan unlock off", str(app.query_one("#limit-readout", Static).render()))
+
+    async def test_legion_section_is_absent_without_toggles(self):
+        with ExitStack() as stack:
+            app = headless_app(stack)
+            async with app.run_test() as pilot:
+                await settle(app, pilot)
+                self.assertEqual(len(app.query(ToggleRow)), 0)
+                self.assertNotIn("Legion", str(app.query_one("#limit-readout", Static).render()))
+
+    async def test_restore_brings_back_legion_choices_and_apply_rereads_them(self):
+        toggle = legion_toggle("fan-unlock", live=False)
+        saved = {"options": {"legion-fan-unlock": "on", "legion-touchpad": "off"}}
+        with ExitStack() as stack:
+            app = headless_app(stack, legion=[toggle], saved=saved)
+            run_command = stack.enter_context(patch("app.run_command"))
+            async with app.run_test() as pilot:
+                await settle(app, pilot)
+                app.restore_saved()
+                await pilot.pause()
+                row = app.query_one(ToggleRow)
+                self.assertEqual(row.query_one(Select).value, "on")
+                self.assertEqual(app.options["legion-fan-unlock"], "on")
+                self.assertTrue(toggle.modified("on"))
+
+                app.action_apply()
+                await settle(app, pilot)
+                self.assertIsInstance(app.screen, ApplyConfirmation)
+                self.assertEqual(app.screen.plan.toggles, {"legion-fan-unlock": True})
+                self.assertIn(f"{LEGION_CLI} fan-unlock-enable", str(app.screen.query_one("#confirm-commands Static").render()))
+
+                # After the write legion_cli is asked again rather than trusted.
+                reread = legion_toggle("fan-unlock", live=True)
+                stack.enter_context(patch("app.probe_legion_toggles", return_value=(LEGION_CLI, [reread])))
+                self.assertTrue(await pilot.click("#confirm"))
+                await settle(app, pilot)
+                self.assertIn("Applied successfully", activity_text(app))
+                self.assertEqual(toggle.live, True)
+                self.assertNotIn("●", str(row.query_one(".setting-name", Label).render()))
+                self.assertIn("live: on", str(row.query_one("#range", Static).render()))
+            # The choice is saved with the other options; the stray touchpad one was ignored.
+            options = json.loads(app_module.LAST_VALUES.read_text())["options"]
+        self.assertEqual(options["legion-fan-unlock"], "on")
+        self.assertEqual(options["legion-touchpad"], "keep")
+        writes = [call.args[0] for call in run_command.call_args_list if call.kwargs.get("access") == "write"]
+        self.assertIn(["sudo", "-n", LEGION_CLI, "fan-unlock-enable"], writes)
+
+    async def test_startup_neither_marks_a_change_nor_overwrites_the_saved_file(self):
+        # Input posts Changed for its initial text at mount; that is not an
+        # edit, so Restore must still find the previous session's preview.
+        setting = clock_row(3000)
+        saved = {"values": {"cpu-p-core-maximum-frequency": 4500}, "options": {"intel-mode": "undervolt"}}
+        with ExitStack() as stack:
+            app = headless_app(stack, settings=[setting], saved=saved)
+            stack.enter_context(patch("app.SAVE_DELAY", 0.05))
+            stack.enter_context(patch("app.intel_controls.live_control_state", return_value=({}, {})))
+            path = app_module.LAST_VALUES
+            async with app.run_test() as pilot:
+                await settle(app, pilot)
+                await asyncio.sleep(0.3)
+                await pilot.pause()
+                self.assertIsNone(app.save_timer)
+                self.assertIsNone(app.last_change)
+                self.assertIn("No preview change", activity_text(app))
+                self.assertEqual(json.loads(path.read_text())["values"], {"cpu-p-core-maximum-frequency": 4500})
+
+                # A save pending from a fresh edit must not pre-empt Restore either.
+                stack.enter_context(patch("app.SAVE_DELAY", 30))
+                app.query_one(ValueRow).action_step(1)
+                await pilot.pause()
+                self.assertIsNotNone(app.save_timer)
+                app.restore_saved()
+                await pilot.pause()
+                self.assertEqual(setting.value, 4500)
+                self.assertEqual(app.options["intel-mode"], "undervolt")
+                self.assertIsNone(app.save_timer)
+
+    async def test_a_live_reading_outside_the_range_survives_mount(self):
+        setting = TuningValue("NVIDIA core clock minimum", 210, 405, 1410, "MHz", choices=(405, 1200, 1410))
+        setting.live = 210
+        with ExitStack() as stack:
+            app = headless_app(stack, nvidia=[setting])
+            async with app.run_test() as pilot:
+                await settle(app, pilot)
+                row = app.query_one(ValueRow)
+                self.assertEqual(setting.value, 210)
+                self.assertEqual(row.query_one("#value", Input).value, "210")
+                self.assertNotIn("●", str(row.query_one(".setting-name", Label).render()))
+                self.assertIsNone(app.last_change)
+
+    async def test_a_failed_save_is_reported_and_the_app_keeps_running(self):
+        setting = clock_row(3000)
+        with ExitStack() as stack:
+            app = headless_app(stack, settings=[setting])
+            stack.enter_context(patch("app.write_last_values", side_effect=PermissionError("read-only")))
+            stack.enter_context(patch("app.SAVE_DELAY", 0.05))
+            notify = stack.enter_context(patch.object(TunnerApp, "notify"))
+            async with app.run_test() as pilot:
+                await settle(app, pilot)
+                app.query_one(ValueRow).action_step(1)
+                await asyncio.sleep(0.3)
+                await pilot.pause()
+                self.assertTrue(app.is_running)
+                self.assertIn("Could not save last-values.json", activity_text(app))
+
+                app.apply_confirmed(ApplyPlan([(["sudo", "-n", "true"], None)], {setting.key: 3100}))
+                await settle(app, pilot)
+                self.assertTrue(app.is_running)
+                self.assertEqual(setting.live, 3100)
+                self.assertIn("Could not save last-values.json", activity_text(app))
+        messages = [call.args[0] for call in notify.call_args_list]
+        self.assertIn("Applied to hardware", messages)
+        self.assertTrue(any("Could not save" in message for message in messages))
+
+    async def test_a_partial_apply_promotes_only_what_ran(self):
+        first, second = clock_row(3000), TuningValue("NVIDIA power ceiling", 150, 5, 175, "W")
+        ok, bad = ["sudo", "-n", "true"], ["sudo", "-n", "nvidia-smi", "-i", "0", "-pl", "150"]
+        failure = subprocess.CalledProcessError(1, bad, stderr="GPU is lost\n")
+
+        def run(arguments, **kwargs):
+            if arguments == bad:
+                raise failure
+            return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+        with ExitStack() as stack:
+            app = headless_app(stack, settings=[first, second])
+            stack.enter_context(patch("app.run_command", side_effect=run))
+            async with app.run_test() as pilot:
+                await settle(app, pilot)
+                # Both rows edited away from their readings (the probe made
+                # the starting values live).
+                first.value, second.live = 3100, 175
+                for row in app.query(ValueRow):
+                    row.refresh_value()
+                plan = ApplyPlan(
+                    [(ok, None), (bad, None)],
+                    {first.key: 3100, second.key: 150},
+                    carried=[{first.key: 3100}, {second.key: 150}],
+                )
+                app.apply_confirmed(plan)
+                await settle(app, pilot)
+                self.assertIn("Apply failed", activity_text(app))
+                self.assertEqual(first.live, 3100)
+                self.assertFalse(first.modified)
+                self.assertEqual(second.live, 175)
+                self.assertTrue(second.modified)
+                names = [str(row.query_one(".setting-name", Label).render()) for row in app.query(ValueRow)]
+                self.assertNotIn("●", names[0])
+                self.assertIn("●", names[1])
+
+    async def test_command_output_is_shown_verbatim_not_as_markup(self):
+        command = ["sudo", "-n", "python", "intel_controls.py"]
+        failure = subprocess.CalledProcessError(1, command, stderr="Intel apply failed ([E] Model not supported)\n")
+        with ExitStack() as stack:
+            app = headless_app(stack)
+            stack.enter_context(patch("app.run_command", side_effect=failure))
+            notify = stack.enter_context(patch.object(app_module.App, "notify"))
+            async with app.run_test() as pilot:
+                await settle(app, pilot)
+                app.apply_confirmed(ApplyPlan([(command, None)]))
+                await settle(app, pilot)
+                self.assertIn("[E] Model not supported", activity_text(app))
+        # The base method is mocked, so the override's super() call reaches it unbound.
+        failure_toast = next(call for call in notify.call_args_list if "Apply failed" in call.args[0])
+        self.assertIn("[E] Model not supported", failure_toast.args[0])
+        self.assertFalse(failure_toast.kwargs["markup"])
 
     async def test_unavailable_memory_clock_stays_disabled_in_locked_mode(self):
         setting = TuningValue(
@@ -803,6 +1239,7 @@ class LayoutTest(unittest.IsolatedAsyncioTestCase):
         setting = clock_row(3000)
         with ExitStack() as stack:
             app = headless_app(stack, settings=[setting], saved={"values": {}})
+            stack.enter_context(patch("app.SAVE_DELAY", 30))  # only the exit flush may write
             path = app_module.LAST_VALUES  # the temporary file headless_app patched in
             async with app.run_test() as pilot:
                 await settle(app, pilot)
@@ -1018,16 +1455,18 @@ class LayoutTest(unittest.IsolatedAsyncioTestCase):
         notify.assert_called_once()
         self.assertIn("bad widget", notify.call_args.args[0])
 
-    async def test_superseded_telemetry_poll_keeps_the_newer_sample(self):
+    async def test_a_slow_telemetry_poll_still_lands_and_ticks_do_not_pile_up(self):
         gate = threading.Event()
+        started = threading.Event()
         polls = []
 
         def read(groups):
             polls.append(groups)
             if len(polls) == 2:
+                started.set()
                 gate.wait(10)  # the poll that outlives the next tick
                 return Telemetry(cpu_temperature=50.0)
-            return Telemetry(cpu_temperature=40.0 if len(polls) == 1 else 70.0)
+            return Telemetry(cpu_temperature=40.0)
 
         with ExitStack() as stack:
             app = headless_app(stack, poll=True)
@@ -1037,16 +1476,18 @@ class LayoutTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app.telemetry.cpu_temperature, 40.0)
 
                 app.refresh_telemetry()
-                for _ in range(50):
-                    await pilot.pause()
-                    if len(polls) == 2:
-                        break
-                app.refresh_telemetry()  # supersedes the stalled poll
+                await asyncio.to_thread(started.wait, 10)
+                # Ticks while the slow poll runs are skipped, not stacked or cancelled.
+                app.refresh_telemetry()
+                app.refresh_telemetry()
+                await pilot.pause()
+                self.assertEqual(len(polls), 2)
+
                 gate.set()
                 await settle(app, pilot)
-
-                self.assertEqual(app.telemetry.cpu_temperature, 70.0)
-                self.assertNotIn(50.0, app.history["cpu_temperature"])
+                self.assertEqual(app.telemetry.cpu_temperature, 50.0)
+                self.assertIn(50.0, app.history["cpu_temperature"])
+                self.assertIn("Rated boost unavailable", app.telemetry.cpu_boost)
 
     async def test_controls_remain_visible_after_resize(self):
         await self.check_resize_layout(confirmation_open=False)
@@ -1157,6 +1598,18 @@ class TelemetryFormatTest(unittest.TestCase):
                 "Intel thermal offset",
             ],
         )
+
+    def test_intel_config_beyond_the_spec_is_clamped_with_a_note(self):
+        # Firmware's "unlimited" 4095.875 W rounds to 4096, one past the MSR bound.
+        config = "power package 4095.875/2 45/28\ntjoffset -10\n"
+        with patch("intel_controls.Path.read_text", return_value=config):
+            settings = {setting.key: setting for setting in intel_values()}
+
+        burst = settings["intel-pl2-burst-power"]
+        self.assertEqual(burst.value, 4095)
+        self.assertIn("Config reads 4096 W; shown clamped to 4095", burst.note)
+        self.assertIsNone(burst.unavailable_reason)
+        self.assertIsNone(settings["intel-pl1-sustained-power"].note)
 
 
 if __name__ == "__main__":

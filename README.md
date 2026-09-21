@@ -22,7 +22,7 @@ Run the tests with `.venv/bin/python -m unittest`.
 ## The plan
 
 The left pane groups the controls into CPU policy, Intel package limits,
-Lenovo Custom Mode, and NVIDIA sections. Each section starts with the mode
+Lenovo Custom Mode, Legion features, and NVIDIA sections. Each section starts with the mode
 selector that gates its rows (Turbo, the Intel apply mode, the Lenovo profile,
 the GPU clock modes), and a row its selector does not apply shows why in place
 of its range, such as *Needs Custom profile*. Every row is a typed field:
@@ -38,17 +38,23 @@ change is saved to `last-values.json` after a moment's pause; **Restore
 saved** (`r`) loads it back into the interface, including the mode choices.
 
 CPU policies are grouped by base frequency, so a hybrid CPU gets independent
-P-core and E-core floors and ceilings and a uniform CPU gets one pair; the
+P-core and E-core floors and ceilings and a uniform CPU gets one pair; a
+driver that reports no base frequency (amd-pstate) gets one pair too, since
+a slightly higher rated maximum on preferred cores is not a core type. The
 bounds come from the driver's `cpuinfo_min_freq`/`cpuinfo_max_freq`. With
 Turbo off the ceiling must stay at or below the base frequency, because the
-kernel caps there anyway. For a 4 GHz P-core cap on an i9-13900HX, select
-Turbo On and set the P-core maximum to 4000 MHz.
+kernel caps there anyway; without an `intel_pstate` Turbo switch the selector
+is disabled, nothing is written for it, and the rated maximum is the limit.
+For a 4 GHz P-core cap on an i9-13900HX, select Turbo On and set the P-core
+maximum to 4000 MHz.
 
 Keys: `a` Apply · `r` Restore saved · `v` Revert to live · `c`/`g` toggle CPU
 or GPU stress · `t` show or hide the status pane · `l` jump to the Apply log ·
-`q` quit. `ctrl+p` opens the command palette, which lists the same actions and
-the theme switcher; the interface uses the terminal theme's colours, so light
-themes work too.
+`q` quit. While a value field has focus only `a`, `t` and `l` still work as
+shortcuts; every other letter is swallowed, so a stray `q` cannot quit or `r`
+overwrite the plan mid-edit. `ctrl+p` opens the command palette, which lists
+the same actions and the theme switcher; the interface uses the terminal
+theme's colours, so light themes work too.
 
 ## Live status
 
@@ -104,6 +110,30 @@ RAPL limit; the thermal offset has no unprivileged readback, so it comes from
 the last saved preview or the −10 default. A live reading the hardware stores
 as "unlimited" is clamped to the 4095 W bound and the raw reading is shown in
 place of the range.
+
+## Legion features
+
+The **Legion features** section covers the boolean switches of
+[LenovoLegionLinux](https://github.com/johnfanv2/LenovoLegionLinux)'s
+`legion_cli`: fan unlock, maximum fan speed, lock fan controller, mini fan
+curve, battery conservation, rapid charging, always-on USB charging, Fn lock,
+touchpad, and hybrid mode. Each row shows the state `legion_cli
+<feature>-status` reported beside a **Keep current / Enable / Disable**
+selector. Keep, the default, runs nothing; Enable or Disable adds `sudo -n
+legion_cli <feature>-enable` or `-disable` to the confirmed Apply, after the
+profile and clock writes so a profile switch cannot undo a fan toggle. A
+choice that differs from the live state is marked `●`, the **Planned limits**
+readout lists the toggles an Apply would run, and choices are saved and
+restored with the other mode selectors.
+
+States are read once at startup and again after any Apply that ran a
+`legion_cli` command, not polled: enabling rapid charging turns conservation
+off, and hybrid mode only takes effect after a reboot, so the app asks
+`legion_cli` rather than assuming a write stuck. A row whose feature the
+firmware or kernel module does not expose, or whose status could not be read,
+is disabled with the reason in place of its state (hover for `legion_cli`'s
+full output); without `legion_cli` on `PATH` the whole section is disabled.
+The **About Legion features** fold describes what each switch does.
 
 ## Apply
 
