@@ -57,19 +57,33 @@ def validate_values(values):
         raise ValueError('Intel PL1 must not exceed PL2')
 
 
-def parse_config(text):
+# The config's units and how many of the app's units each one is: it keeps
+# time windows in seconds, the app in milliseconds.
+CONFIG_UNIT_SCALE = {'W': 1, 's': 1000, '°C': 1}
+
+
+def config_readings(text):
+    """Each control's token exactly as the config writes it, with the config's unit."""
     power = POWER_LINE.findall(text)
     thermal = THERMAL_LINE.findall(text)
     if len(power) != 1 or len(thermal) != 1:
         raise ValueError('Expected one package power line and one thermal offset')
-    values = {'intel-thermal-offset': int(thermal[0])}
+    readings = {'intel-thermal-offset': (thermal[0], '°C')}
     for term, token in zip(('pl2-burst', 'pl1-sustained'), power[0]):
         if ':' in token:
             raise ValueError('Explicit enable/disable flags require manual configuration')
         watts, seconds = token.split('/')
-        values[f'intel-{term}-power'] = round(float(watts))
-        values[f'intel-{term.split("-")[0]}-time-window'] = round(float(seconds) * 1000)
-    return values
+        readings[f'intel-{term}-power'] = (watts, 'W')
+        readings[f'intel-{term.split("-")[0]}-time-window'] = (seconds, 's')
+    return readings
+
+
+def parse_config(text):
+    """Each control as a whole number in the app's units."""
+    return {
+        key: round(float(token) * CONFIG_UNIT_SCALE[unit])
+        for key, (token, unit) in config_readings(text).items()
+    }
 
 
 def updated_config(text, values):

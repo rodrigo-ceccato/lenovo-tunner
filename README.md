@@ -126,27 +126,32 @@ choice that differs from the live state is marked `●`, the **Planned limits**
 readout lists the toggles an Apply would run, and choices are saved and
 restored with the other mode selectors.
 
-States are read once at startup and again after any Apply that ran a
-`legion_cli` command, not polled: enabling rapid charging turns conservation
+States are read once at startup and again after every Apply, not polled: a
+profile switch can reset fan state, enabling rapid charging turns conservation
 off, and hybrid mode only takes effect after a reboot, so the app asks
-`legion_cli` rather than assuming a write stuck. A row whose feature the
-firmware or kernel module does not expose, or whose status could not be read,
-is disabled with the reason in place of its state (hover for `legion_cli`'s
-full output); without `legion_cli` on `PATH` the whole section is disabled.
-The **About Legion features** fold describes what each switch does.
+`legion_cli` rather than assuming a write stuck. Asking for battery
+conservation and rapid charging together is rejected before the dialog, since
+the second write would undo the first. A row whose feature the firmware or
+kernel module does not expose is disabled with the reason in place of its
+state (hover for `legion_cli`'s full output); a row whose status could not be
+read says so but stays editable, because the write runs as root and a read
+denied to the user says nothing about it. Without `legion_cli` on `PATH` the
+whole section is disabled. The **About Legion features** fold describes what
+each switch does.
 
 ## Apply
 
 **Apply** first builds the plan; a plan the app rejects (a PL1 above PL2, a
-ceiling above the Turbo cap, an unavailable value) is reported in the log and
-never reaches a dialog. Otherwise a confirmation dialog lists every command
-exactly as it will run, warns if `sudo` has no cached credentials, and
-requires **Apply now** (`Escape` cancels). Authenticate first in the terminal
-with `sudo -v`; the app intentionally uses non-interactive `sudo` and does not
-capture passwords, and the notice under the title says so when the check
-fails at startup. The confirmed commands run in the background with the Apply,
-Restore, and Revert buttons disabled until they finish. A successful Apply
-makes the written previews the new live readings.
+ceiling above the Turbo cap, an unavailable value, both battery modes enabled)
+is reported in the log and never reaches a dialog. Otherwise a confirmation
+dialog lists every command exactly as it will run, warns if `sudo` has no
+cached credentials, and requires **Apply now** (`Escape` cancels).
+Authenticate first in the terminal with `sudo -v`; the app intentionally uses
+non-interactive `sudo` and does not capture passwords, and the notice under
+the title says so when the check fails at startup. The confirmed commands run
+in the background with the Apply, Restore, and Revert buttons disabled until
+they finish. A successful Apply makes the written previews the new live
+readings.
 
 The **Apply command log** shows the commands attempted by the latest Apply and
 whether each one succeeded, with `APPLIED` in green and `FAILED` in red. A

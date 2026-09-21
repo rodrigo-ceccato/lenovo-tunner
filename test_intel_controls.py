@@ -128,6 +128,18 @@ class ConfigRewriteTest(unittest.TestCase):
         '\n'
     )
 
+    def test_config_readings_keep_the_file_text_and_units(self):
+        self.assertEqual(
+            intel_controls.config_readings(self.CONFIG),
+            {
+                'intel-pl2-burst-power': ('55', 'W'),
+                'intel-pl2-time-window': ('2', 's'),
+                'intel-pl1-sustained-power': ('45', 'W'),
+                'intel-pl1-time-window': ('28', 's'),
+                'intel-thermal-offset': ('-10', '°C'),
+            },
+        )
+
     def test_round_trip_keeps_blank_lines_and_other_directives(self):
         values = intel_controls.parse_config(self.CONFIG)
         self.assertEqual(
