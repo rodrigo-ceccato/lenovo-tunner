@@ -2,25 +2,48 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections import deque
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from functools import partial
+import json
 import os
+from pathlib import Path
 import re
 import signal
 import subprocess
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from pathlib import Path
-import json
 import sys
-import intel_controls
-from command_log import record_command, render_command
 
+from rich.text import Text
+from textual import work
 from textual.app import App, ComposeResult
-from textual.events import Resize
+from textual.binding import Binding
+from textual.command import DiscoveryHit, Hit, Hits, Provider
 from textual.containers import Container, Horizontal, VerticalScroll
+from textual.events import MouseScrollDown, MouseScrollUp, Resize
 from textual.message import Message
 from textual.screen import ModalScreen
+from textual.timer import Timer
 from textual.validation import Number
-from textual.widgets import Button, Footer, Header, Input, Label, RichLog, Static, Select
+from textual.worker import get_current_worker
+from textual.widgets import (
+    Button,
+    Collapsible,
+    Footer,
+    Header,
+    Input,
+    Label,
+    LoadingIndicator,
+    RichLog,
+    Select,
+    Sparkline,
+    Static,
+)
+
+import intel_controls
+from command_log import record_command, render_command
 
 
 DOCUMENT = Path(__file__).with_name("lenovo-tuning.md")
@@ -33,10 +56,45 @@ LENOVO_ATTRIBUTES = {
     "lenovo-gpu-temperature-target": "gpu_temp",
 }
 LENOVO_ATTRIBUTE_ROOT = Path("/sys/class/firmware-attributes/lenovo-wmi-other-0/attributes")
+PLATFORM_PROFILE = Path("/sys/firmware/acpi/platform_profile")
+CPUFREQ_ROOT = Path("/sys/devices/system/cpu/cpufreq")
+NO_TURBO = Path("/sys/devices/system/cpu/intel_pstate/no_turbo")
+NVIDIA_GPU_INDEX = "0"
 RANGE_PATTERN = re.compile(
     r"allowed range:\s*(?P<minimum>\d+)\s*[–-]\s*(?P<maximum>\d+)\s*(?P<unit>[^. `|]+)",
     re.IGNORECASE,
 )
+# Policy groups are named by base frequency, highest first: P/E on a hybrid
+# CPU, "all" on a uniform one. The short form goes into row names and keys.
+CPU_GROUP_LABELS = {"p": "P-cores", "e": "E-cores", "all": "All cores"}
+CPU_GROUP_SHORT = {"p": "P", "e": "E", "all": "all"}
+NARROW_WIDTH = 120  # Below this the status pane no longer fits beside the plan.
+COMPACT_WIDTH = 80  # Below this the range hints go too, to keep names readable.
+HISTORY_LENGTH = 60  # Two minutes of 2-second samples per sparkline.
+BAR_WIDTH = 24
+SAVE_DELAY = 0.5  # Seconds of quiet before a preview change is written to disk.
+INTEL_HELP = (
+    "Intel windows use milliseconds (1000 ms = 1 s), not exact boost timers. "
+    "Thermal offset is relative to 100°C on this CPU. Persistent apply updates "
+    "/etc/intel-undervolt.conf and reapplies its existing voltage offsets. "
+    "Python undervolt writes only these live limits through MSRs and does not "
+    "persist them. UI bounds are app limits, not hardware guarantees."
+)
+TONES = ("ok", "error", "muted", "warning")
+
+PlannedCommand = tuple[list[str], str | None]
+
+
+@dataclass
+class ApplyPlan:
+    """What one Apply would run, and the previews those commands carry."""
+
+    commands: list[PlannedCommand] = field(default_factory=list)
+    # key -> value for every setting a command was built from, captured when
+    # the plan was made. A successful Apply makes exactly these the live
+    # readings: not a row the modes never wrote, and not an edit typed while
+    # the commands were running.
+    values: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -54,22 +112,22 @@ class TuningValue:
     # Shown in place of the range when the value needs a caveat, such as a
     # live reading that had to be clamped into the spec.
     note: str | None = None
+    # The value the row started from: the hardware reading at startup or the
+    # last confirmed Apply. A preview that differs from it is marked edited.
+    live: int | None = None
+
+    def nearest_choice(self, value: int) -> int:
+        return min(self.choices, key=lambda choice: abs(choice - value))
 
     def change(self, amount: int) -> None:
-        if self.value is None:
+        """Move `amount` steps, or supported clocks, in either direction."""
+        if self.value is None or amount == 0:
             return
         if self.choices:
-            index = min(
-                range(len(self.choices)),
-                key=lambda candidate: abs(self.choices[candidate] - self.value),
-            )
-            self.value = self.choices[
-                max(0, min(len(self.choices) - 1, index + (1 if amount > 0 else -1)))
-            ]
+            index = self.choices.index(self.nearest_choice(self.value))
+            self.value = self.choices[max(0, min(len(self.choices) - 1, index + amount))]
             return
-        self.value = max(
-            self.minimum, min(self.maximum, self.value + (self.step if amount > 0 else -self.step))
-        )
+        self.value = max(self.minimum, min(self.maximum, self.value + amount * self.step))
 
     def can_change(self, amount: int) -> bool:
         if self.value is None:
@@ -77,6 +135,10 @@ class TuningValue:
         if self.choices:
             return self.value != (self.choices[-1] if amount > 0 else self.choices[0])
         return self.value != (self.maximum if amount > 0 else self.minimum)
+
+    @property
+    def modified(self) -> bool:
+        return self.value != self.live
 
     @property
     def key(self) -> str:
@@ -94,9 +156,8 @@ class Telemetry:
     gpu_clock: int | None = None
     gpu_memory_clock: int | None = None
     cpu_clock: int | None = None
-    cpu_policy_minimum: int | None = None
-    cpu_policy_maximum: int | None = None
     turbo_enabled: bool | None = None
+    profile: str | None = None
     cpu_policies: str = "Policy readings unavailable"
     cpu_boost: str = "Rated boost unavailable"
     gpu_power_limit: float | None = None
@@ -104,9 +165,10 @@ class Telemetry:
     gpu_max_memory: float | None = None
     gpu_headroom: float | None = None
     gpu_reasons: str = "Unavailable"
+    intel_limits: str = "PL1: unavailable\nPL2: unavailable"
 
     @staticmethod
-    def bar(value: float | None, ceiling: float | None, width: int = 18) -> str:
+    def bar(value: float | None, ceiling: float | None, width: int = BAR_WIDTH) -> str:
         """A compact, dependable gauge that also works in a plain terminal."""
         if value is None or ceiling is None or ceiling <= 0:
             return "─" * width
@@ -155,44 +217,70 @@ def load_values(document: Path = DOCUMENT) -> list[TuningValue]:
     return probe_documented_values(values)
 
 
-def policy_values(filename: str) -> list[int]:
-    """Read a CPU policy attribute from every policy available to this system."""
-    return [
-        int(path.read_text(encoding="utf-8").strip()) // 1_000
-        for path in Path("/sys/devices/system/cpu/cpufreq").glob(f"policy*/{filename}")
-    ]
+def policy_reading(policy: Path, attribute: str) -> int:
+    """Read one cpufreq attribute of a policy, in MHz."""
+    return int((policy / attribute).read_text(encoding="utf-8").strip()) // 1_000
 
 
 def turbo_state() -> bool | None:
     """Return the live Intel P-state turbo state, if this CPU exposes it."""
     try:
         # Intel exposes 0 for turbo allowed and 1 for turbo disabled.
-        return Path("/sys/devices/system/cpu/intel_pstate/no_turbo").read_text(
-            encoding="utf-8"
-        ).strip() == "0"
+        return NO_TURBO.read_text(encoding="utf-8").strip() == "0"
     except OSError:
         return None
 
 
+def live_profile() -> str | None:
+    """Return the firmware's current platform profile, if it exposes one."""
+    try:
+        return PLATFORM_PROFILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
 
 
 def cpu_groups() -> dict[str, list[Path]]:
-    """Identify this machine's hybrid policies without assuming CPU numbering."""
-    groups: dict[str, list[Path]] = {"p": [], "e": []}
-    if "i9-13900HX" not in Path("/proc/cpuinfo").read_text():
-        return groups
-    for policy in Path("/sys/devices/system/cpu/cpufreq").glob("policy*"):
-        try:
-            base = int((policy / "base_frequency").read_text())
-            group = {2200000: "p", 1600000: "e"}.get(base)
-            if group:
-                groups[group].append(policy)
-        except (OSError, ValueError):
-            pass
-    return groups
+    """Group cpufreq policies by base frequency without assuming a CPU model.
+
+    Two or more tiers are named "p", "e" (then "e2", ...) from the highest
+    base down; a uniform CPU is a single "all" group. Drivers that expose no
+    base_frequency are grouped by their rated maximum instead.
+    """
+    policies = sorted(CPUFREQ_ROOT.glob("policy*"))
+    tiers: dict[int, list[Path]] = {}
+    for attribute in ("base_frequency", "cpuinfo_max_freq"):
+        tiers = {}
+        for policy in policies:
+            try:
+                tiers.setdefault(policy_reading(policy, attribute), []).append(policy)
+            except (OSError, ValueError):
+                continue
+        if tiers:
+            break
+    if not tiers:
+        return {}
+    if len(tiers) == 1:
+        return {"all": next(iter(tiers.values()))}
+    names = ["p", "e"] + [f"e{index}" for index in range(2, len(tiers))]
+    return {name: tiers[base] for name, base in zip(names, sorted(tiers, reverse=True))}
 
 
-def intel_values():
+def cpu_group_limits(policies: list[Path]) -> tuple[int, int | None, int]:
+    """Return the driver's (floor, base, ceiling) in MHz for a policy group."""
+    floor = min(policy_reading(policy, "cpuinfo_min_freq") for policy in policies)
+    ceiling = max(policy_reading(policy, "cpuinfo_max_freq") for policy in policies)
+    try:
+        base = max(policy_reading(policy, "base_frequency") for policy in policies)
+    except (OSError, ValueError):
+        base = None
+    return floor, base, ceiling
+
+
+def cpu_group_name(group: str) -> str:
+    return CPU_GROUP_SHORT.get(group, group.upper())
+
+
+def intel_values() -> list[TuningValue]:
     try:
         values = intel_controls.parse_config(intel_controls.CONFIG.read_text())
     except (OSError, ValueError):
@@ -203,25 +291,40 @@ def intel_values():
             for key, (low, high, unit, step) in intel_controls.SPECS.items()]
 
 
-def cpu_clock_values() -> list[TuningValue]:
+def cpu_clock_values(groups: dict[str, list[Path]]) -> list[TuningValue]:
+    """One floor and one ceiling row per policy group, bounded by the driver."""
     settings = []
-    for group, policies in cpu_groups().items():
+    for group, policies in groups.items():
+        try:
+            floor, _, ceiling = cpu_group_limits(policies)
+            # A fixed-frequency policy reports floor == ceiling; only an
+            # inverted range means the driver's limits cannot be trusted.
+            limits_known = floor <= ceiling
+        except (OSError, ValueError):
+            floor, ceiling, limits_known = 0, 0, False
         for bound in ("minimum", "maximum"):
+            attribute = "scaling_min_freq" if bound == "minimum" else "scaling_max_freq"
             try:
-                readings = [int((p / f"scaling_{'min' if bound == 'minimum' else 'max'}_freq").read_text()) // 1000 for p in policies]
-                current = (max(readings) if bound == "minimum" else min(readings)) if readings else None
+                readings = [policy_reading(policy, attribute) for policy in policies]
+                current = max(readings) if bound == "minimum" else min(readings)
             except (OSError, ValueError):
                 current = None
-            settings.append(TuningValue(f"CPU {group.upper()}-core {bound} frequency", current, 800,
-                                        5400 if group == "p" else 3900, "MHz", step=100,
-                                        unavailable_reason="Policy unavailable" if current is None else None))
+            unavailable = None
+            if not limits_known:
+                current, unavailable = None, "Policy limits unavailable"
+            elif current is None:
+                unavailable = "Policy unavailable"
+            else:
+                current = max(floor, min(ceiling, current))
+            settings.append(TuningValue(f"CPU {cpu_group_name(group)}-core {bound} frequency", current,
+                                        floor, ceiling, "MHz", step=100, unavailable_reason=unavailable))
     return settings
 
 
 def nvidia_output(arguments: list[str]) -> str:
     """Run a read-only NVIDIA query; no shell or setting-changing option is used."""
     return run_command(
-        ["nvidia-smi", *arguments], access="read",
+        ["nvidia-smi", "-i", NVIDIA_GPU_INDEX, *arguments], access="read",
         check=True,
         capture_output=True,
         text=True,
@@ -276,8 +379,6 @@ def probe_documented_values(settings: list[TuningValue]) -> list[TuningValue]:
         try:
             report = nvidia_output(
                 [
-                    "-i",
-                    "0",
                     "--query-gpu=enforced.power.limit,power.min_limit,power.max_limit",
                     "--format=csv,noheader,nounits",
                 ]
@@ -362,8 +463,6 @@ def nvidia_power_limit_available() -> bool:
     try:
         limits = nvidia_output(
             [
-                "-i",
-                "0",
                 "--query-gpu=power.min_limit,power.max_limit",
                 "--format=csv,noheader,nounits",
             ]
@@ -374,7 +473,75 @@ def nvidia_power_limit_available() -> bool:
         return False
 
 
-def read_telemetry() -> Telemetry:
+def sudo_ready() -> bool:
+    """Return whether sudo has cached credentials, without ever prompting."""
+    try:
+        return run_command(
+            ["sudo", "-n", "true"], access="exec", capture_output=True, text=True, timeout=5
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def cpu_temperature_from_sensors(report: object) -> float | None:
+    """Pick the package, Tctl, or CPU temperature out of `sensors -j` output.
+
+    Only temp*_input readings qualify, so a fan labelled "CPU Fan" never
+    passes its RPM off as a temperature, and the package sensor wins over a
+    generic "cpu" label whatever order the chips are listed in.
+    """
+    if not isinstance(report, dict):
+        return None
+    terms = ("package", "tctl", "cpu")
+    found: dict[str, float] = {}
+    for chip in report.values():
+        if not isinstance(chip, dict):
+            continue
+        for label, readings in chip.items():
+            if not isinstance(readings, dict):
+                continue
+            term = next((term for term in terms if term in label.lower()), None)
+            temperature = next(
+                (
+                    value for key, value in readings.items()
+                    if key.startswith("temp") and key.endswith("_input")
+                    and isinstance(value, (int, float))
+                ),
+                None,
+            )
+            if term is not None and temperature is not None:
+                found.setdefault(term, float(temperature))
+    return next((found[term] for term in terms if term in found), None)
+
+
+def describe_cpu_policies(groups: dict[str, list[Path]]) -> tuple[str, str, int | None]:
+    """Return (live policy ranges per group, rated boost per group, average MHz)."""
+    lines, boosts, currents = [], [], []
+    for group, policies in groups.items():
+        try:
+            floors = [policy_reading(policy, "scaling_min_freq") for policy in policies]
+            ceilings = [policy_reading(policy, "scaling_max_freq") for policy in policies]
+            now = [policy_reading(policy, "scaling_cur_freq") for policy in policies]
+            rated = max(policy_reading(policy, "cpuinfo_max_freq") for policy in policies)
+        except (OSError, ValueError):
+            continue
+        currents += now
+        label = CPU_GROUP_LABELS.get(group, group.upper())
+        lines.append(
+            f"{label}: {max(floors)}–{min(ceilings)} MHz\n  Now {sum(now) / len(now):.0f} MHz avg"
+        )
+        boosts.append(f"{cpu_group_name(group)}: up to {rated}")
+    policies_text = "\n".join(lines) or "Policy readings unavailable"
+    boost_text = (
+        "Rated boost (not a live limit)\n" + " · ".join(boosts) + " MHz"
+        if boosts
+        else "Rated boost unavailable"
+    )
+    average = round(sum(currents) / len(currents)) if currents else None
+    return policies_text, boost_text, average
+
+
+def read_telemetry(groups: dict[str, list[Path]]) -> Telemetry:
     """Read CPU and GPU telemetry without changing any hardware setting."""
     telemetry = Telemetry()
     try:
@@ -384,23 +551,7 @@ def read_telemetry() -> Telemetry:
                 check=True, capture_output=True, text=True, timeout=3
             ).stdout
         )
-        for chip in report.values():
-            if not isinstance(chip, dict):
-                continue
-            for label, readings in chip.items():
-                if not isinstance(readings, dict) or not any(
-                    term in label.lower() for term in ("package", "tctl", "cpu")
-                ):
-                    continue
-                temperature = next(
-                    (value for key, value in readings.items() if key.endswith("_input")),
-                    None,
-                )
-                if isinstance(temperature, (int, float)):
-                    telemetry.cpu_temperature = float(temperature)
-                    raise StopIteration
-    except StopIteration:
-        pass
+        telemetry.cpu_temperature = cpu_temperature_from_sensors(report)
     except (OSError, subprocess.SubprocessError, ValueError):
         pass
 
@@ -415,12 +566,12 @@ def read_telemetry() -> Telemetry:
         fields = ("gpu_temperature", "gpu_power", "gpu_utilization", "gpu_clock",
                   "gpu_memory_clock", "gpu_power_limit", "gpu_max_clock",
                   "gpu_max_memory", "gpu_headroom")
-        for field, raw in zip(fields, parts):
+        for name, raw in zip(fields, parts):
             try:
                 number = float(raw)
             except ValueError:
                 continue  # An unsupported field must not erase other readings.
-            setattr(telemetry, field, round(number) if field == "gpu_utilization" else number)
+            setattr(telemetry, name, round(number) if name == "gpu_utilization" else number)
         try:
             mask = int(parts[9], 16)
             reasons = ((1, "Idle"), (2, "Application clocks"), (4, "Power cap"),
@@ -436,51 +587,25 @@ def read_telemetry() -> Telemetry:
     except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         pass
 
-    try:
-        clocks = policy_values("scaling_cur_freq")
-        if clocks:
-            telemetry.cpu_clock = round(sum(clocks) / len(clocks))
-        minimums = policy_values("scaling_min_freq")
-        maximums = policy_values("scaling_max_freq")
-        if minimums and maximums:
-            telemetry.cpu_policy_minimum = max(minimums)
-            telemetry.cpu_policy_maximum = min(maximums)
-    except (OSError, ValueError):
-        pass
     telemetry.turbo_enabled = turbo_state()
-    groups: dict[tuple[int, int, int], list[int]] = {}
-    for policy in Path("/sys/devices/system/cpu/cpufreq").glob("policy*"):
-        try:
-            base, low, high, current = (
-                int((policy / name).read_text().strip()) // 1000
-                for name in ("base_frequency", "scaling_min_freq", "scaling_max_freq", "scaling_cur_freq")
-            )
-            groups.setdefault((base, low, high), []).append(current)
-        except (OSError, ValueError):
-            continue
-    try:
-        known_cpu = "i9-13900HX" in Path("/proc/cpuinfo").read_text()
-    except OSError:
-        known_cpu = False
-    if groups:
-        lines = []
-        for (base, low, high), clocks in sorted(groups.items(), reverse=True):
-            label = {2200: "P-cores", 1600: "E-cores"}.get(base, f"Base {base}") if known_cpu else f"Base {base}"
-            lines.append(f"{label}: {low}–{high} MHz\n  Now {sum(clocks) / len(clocks):.0f} MHz avg")
-        telemetry.cpu_policies = "\n".join(lines)
-    if known_cpu:
-        telemetry.cpu_boost = "Rated boost (not a live limit)\nP: up to 5400 · E: up to 3900 MHz"
+    telemetry.profile = live_profile()
+    telemetry.cpu_policies, telemetry.cpu_boost, telemetry.cpu_clock = describe_cpu_policies(groups)
+    telemetry.intel_limits = intel_controls.live_limits()
     return telemetry
 
 
-def load_last_values() -> dict[str, int]:
-    """Load only integer values from a previously saved preview state."""
+def load_saved_state() -> tuple[dict[str, int], dict[str, str]]:
+    """Load the integer preview values and option names saved previously."""
     try:
         payload = json.loads(LAST_VALUES.read_text(encoding="utf-8"))
         values = payload.get("values", {})
-        return {key: value for key, value in values.items() if type(value) is int}
+        options = payload.get("options", {})
+        return (
+            {key: value for key, value in values.items() if type(value) is int},
+            {key: value for key, value in options.items() if isinstance(value, str)},
+        )
     except (OSError, ValueError, AttributeError):
-        return {}
+        return {}, {}
 
 
 def write_last_values(settings: list[TuningValue], applied: bool = False, options=None) -> None:
@@ -502,8 +627,94 @@ def write_last_values(settings: list[TuningValue], applied: bool = False, option
     LAST_VALUES.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+@dataclass
+class Probe:
+    """Everything the interface needs from hardware before it can be drawn."""
+
+    settings: list[TuningValue]
+    cpu_groups: dict[str, list[Path]]
+    nvidia_power_limit_available: bool
+    profiles: list[str]
+    profile: str
+    turbo: bool | None
+    # None when the check never ran, so no notice claims that sudo failed.
+    sudo_ready: bool | None
+
+
+def probe_system() -> Probe:
+    """Run every startup read; this blocks, so the app calls it off the loop."""
+    # The policy grouping cannot change while the app runs, so it is read
+    # once here and handed to every later poll and plan.
+    groups = cpu_groups()
+    settings = load_values() + cpu_clock_values(groups) + nvidia_clock_values() + intel_values()
+    for setting in settings:
+        setting.live = setting.value
+    profile = live_profile()
+    try:
+        profiles = PLATFORM_PROFILE.with_name("platform_profile_choices").read_text().split()
+    except OSError:
+        profiles = []
+    if profile is None or not profiles:
+        profiles, profile = [], "unavailable"
+    return Probe(
+        settings, groups, nvidia_power_limit_available(), profiles, profile, turbo_state(), sudo_ready()
+    )
+
+
+def gate_hint(key: str, options: dict[str, str], nvidia_power_available: bool) -> str | None:
+    """Why the selected modes would not write the setting `key`, or None.
+
+    This is the one statement of which rows an Apply writes: the plan reads
+    only ungated previews, the rows show the hint in place of their range,
+    and the status pane counts only ungated targets, so none can disagree.
+    """
+    if key.startswith("intel-") and options["intel-mode"] == "keep":
+        return "Needs an Intel mode"
+    if key.startswith("lenovo-") and options["profile"] != "custom":
+        return "Needs Custom profile"
+    if key.startswith("nvidia-core-clock") and options["core-mode"] != "locked":
+        return "Needs Locked mode"
+    if key.startswith("nvidia-memory-clock") and options["memory-mode"] != "locked":
+        return "Needs Locked mode"
+    if key == "nvidia-power-ceiling" and not nvidia_power_available:
+        return "NVIDIA power range unavailable"
+    return None
+
+
+class NumberInput(Input):
+    """An Input that only swallows the characters it can accept.
+
+    Letters fall through to the app's key bindings, so `a` still applies and
+    `t` still toggles the status pane while a value field has focus.
+    """
+
+    def check_consume_key(self, key: str, character: str | None) -> bool:
+        return character is not None and (character.isdigit() or character == "-")
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        # A one-line field has nothing to scroll; dropping the inherited
+        # scroll bindings lets the row's ↑/↓ steps reach the Footer.
+        if action in ("scroll_up", "scroll_down"):
+            return False
+        return super().check_action(action, parameters)
+
+    async def _on_key(self, event) -> None:
+        if event.is_printable and not self.check_consume_key(event.key, event.character):
+            # Textual runs every _on_key in the class hierarchy, so stop
+            # Input's here; the event still bubbles up to the bindings.
+            event.prevent_default()
+
+
 class ValueRow(Horizontal):
-    """A compact display-only increment/decrement control."""
+    """One editable setting: a typed field with step buttons and key bindings."""
+
+    BINDINGS = [
+        Binding("up", "step(1)", "Step", key_display="↑/↓"),
+        Binding("down", "step(-1)", "Step down", show=False),
+        Binding("shift+up", "step(10)", "×10 up", show=False),
+        Binding("shift+down", "step(-10)", "×10 down", show=False),
+        Binding("ctrl+r", "revert", "Revert"),
+    ]
 
     class Changed(Message):
         def __init__(self, value_row: "ValueRow") -> None:
@@ -513,27 +724,30 @@ class ValueRow(Horizontal):
     def __init__(self, setting: TuningValue) -> None:
         super().__init__(classes="value-row")
         self.setting = setting
+        # Why the row is disabled by a mode selector, shown in the range slot.
+        self.hint: str | None = None
         # Bounds follow the setting, which Restore may narrow after compose.
         self.range_validator = Number(setting.minimum, setting.maximum)
 
     def compose(self) -> ComposeResult:
-        yield Label(self.setting.name, classes="setting-name")
+        yield Label("", classes="setting-name")
         yield Static("", id="range", classes="range")
-        yield Button("−", id="down", classes="step")
-        if self.setting.key.startswith("nvidia-memory-clock"):
-            yield Input(
-                "" if self.setting.value is None else str(self.setting.value),
-                id="value",
-                classes="value",
-                disabled=self.input_disabled,
-                restrict=r"\d*",
-                validators=self.range_validator,
-                validate_on=["changed"],
-                compact=True,
-            )
-        else:
-            yield Static("", id="value", classes="value")
-        yield Button("+", id="up", classes="step")
+        down = Button("−", id="down", classes="step", compact=True)
+        down.can_focus = False
+        yield down
+        yield NumberInput(
+            "" if self.setting.value is None else str(self.setting.value),
+            id="value",
+            classes="value",
+            disabled=self.input_disabled,
+            restrict=r"-?\d*" if self.setting.minimum < 0 else r"\d*",
+            validators=self.range_validator,
+            validate_on=["changed"],
+            compact=True,
+        )
+        up = Button("+", id="up", classes="step", compact=True)
+        up.can_focus = False
+        yield up
 
     @property
     def input_disabled(self) -> bool:
@@ -544,44 +758,91 @@ class ValueRow(Horizontal):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         event.stop()
-        self.setting.change(-1 if event.button.id == "down" else 1)
+        self.action_step(-1 if event.button.id == "down" else 1)
+
+    def action_step(self, amount: int) -> None:
+        if self.disabled or not self.setting.can_change(amount):
+            return
+        self.setting.change(amount)
         self.refresh_value()
         self.post_message(self.Changed(self))
+
+    def revert(self) -> bool:
+        """Put the preview back to its live reading; False when there is none."""
+        if self.disabled or not self.setting.modified or self.setting.live is None:
+            return False
+        self.setting.value = self.setting.live
+        self.refresh_value()
+        return True
+
+    def action_revert(self) -> None:
+        if self.revert():
+            self.post_message(self.Changed(self))
+
+    def on_mouse_scroll_up(self, event: MouseScrollUp) -> None:
+        if self.has_focus_within:
+            event.stop()
+            self.action_step(1)
+
+    def on_mouse_scroll_down(self, event: MouseScrollDown) -> None:
+        if self.has_focus_within:
+            event.stop()
+            self.action_step(-1)
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.validation_result is None or not event.validation_result.is_valid:
             if self.setting.value is not None:
                 self.setting.value = None
-                self.refresh_buttons()
+                self.refresh_decorations()
                 self.post_message(self.Changed(self))
             return
         self.setting.value = int(event.value)
-        self.refresh_buttons()
+        self.refresh_decorations()
         self.post_message(self.Changed(self))
 
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        self.commit_input()
+        self.screen.focus_next()
+
+    def on_input_blurred(self, event: Input.Blurred) -> None:
+        self.commit_input()
+
+    def commit_input(self) -> None:
+        """Snap a typed value onto the supported steps, if the setting has them."""
+        setting = self.setting
+        if setting.choices and setting.value is not None and setting.value not in setting.choices:
+            setting.value = setting.nearest_choice(setting.value)
+            self.refresh_value()
+            self.post_message(self.Changed(self))
+
     def refresh_value(self) -> None:
-        range_text = self.setting.unavailable_reason or self.setting.note or (
-            f"{self.setting.minimum}–{self.setting.maximum} {self.setting.unit}"
+        value = self.query_one("#value", Input)
+        self.range_validator.minimum = self.setting.minimum
+        self.range_validator.maximum = self.setting.maximum
+        value.disabled = self.input_disabled
+        expected = "" if self.setting.value is None else str(self.setting.value)
+        if value.value != expected:
+            # A programmatic sync must not be validated as user input:
+            # that would re-check it against stale bounds and clear it.
+            with value.prevent(Input.Changed):
+                value.value = expected
+        self.refresh_decorations()
+
+    def refresh_decorations(self) -> None:
+        """Update the edited marker, the range or hint text, and the buttons."""
+        modified = self.setting.modified
+        name = self.query_one(".setting-name", Label)
+        name.update(f"{'●' if modified else ' '} {self.setting.name}")
+        name.set_class(modified, "modified")
+        hinted = self.disabled and self.hint is not None
+        range_text = self.hint if hinted else (
+            self.setting.unavailable_reason or self.setting.note
+            or f"{self.setting.minimum}–{self.setting.maximum} {self.setting.unit}"
         )
-        value_text = (
-            "unavailable"
-            if self.setting.value is None
-            else f"{self.setting.value} {self.setting.unit}"
-        )
-        self.query_one("#range", Static).update(range_text)
-        value = self.query_one("#value")
-        if isinstance(value, Input):
-            self.range_validator.minimum = self.setting.minimum
-            self.range_validator.maximum = self.setting.maximum
-            value.disabled = self.input_disabled
-            expected = "" if self.setting.value is None else str(self.setting.value)
-            if value.value != expected:
-                # A programmatic sync must not be validated as user input:
-                # that would re-check it against stale bounds and clear it.
-                with value.prevent(Input.Changed):
-                    value.value = expected
-        else:
-            value.update(value_text)
+        range_widget = self.query_one("#range", Static)
+        range_widget.update(range_text or "")
+        range_widget.set_class(hinted, "hint")
         self.refresh_buttons()
 
     def refresh_buttons(self) -> None:
@@ -594,53 +855,92 @@ class StatusRail(VerticalScroll):
 
     def compose(self) -> ComposeResult:
         yield Static("LIVE STATUS", classes="panel-title")
-        yield Static("Refreshing every 2 seconds", classes="panel-subtitle")
+        yield Static("Refreshing every 2 s · t hides", classes="panel-subtitle")
+        yield Static("", id="cpu-thermal", classes="metric")
+        yield Sparkline([], id="cpu-temperature-trend", classes="trend", summary_function=max)
+        yield Static("", id="gpu-thermal", classes="metric")
+        yield Sparkline([], id="gpu-temperature-trend", classes="trend", summary_function=max)
+        yield Static("", id="gpu-power", classes="metric")
+        yield Sparkline([], id="gpu-power-trend", classes="trend", summary_function=max)
         yield Static("CPU CLOCKS · LIVE POLICY", classes="section-title")
         yield Static("", id="clock-readout", classes="readout")
         yield Static("INTEL PACKAGE · LIVE", classes="section-title")
         yield Static("", id="intel-readout", classes="readout")
-        yield Static("", id="cpu-thermal", classes="metric")
-        yield Static("", id="gpu-thermal", classes="metric")
-        yield Static("", id="gpu-power", classes="metric")
         yield Static("GPU CLOCKS · LIVE", classes="section-title")
         yield Static("", id="gpu-readout", classes="readout")
+        yield Sparkline([], id="gpu-clock-trend", classes="trend", summary_function=max)
         yield Static("PLANNED LIMITS", classes="section-title")
         yield Static("", id="limit-readout", classes="readout")
-        yield Static("Preview changes are saved locally. Apply sends the plan to hardware.", classes="panel-note")
+        yield Static("● marks a preview that differs from its live reading. Apply sends the plan to hardware.", classes="panel-note")
 
-    def refresh_status(self, settings: list[TuningValue], telemetry: Telemetry) -> None:
-        self.query_one('#intel-readout', Static).update(intel_controls.live_limits())
-        values = {setting.key: setting.value for setting in settings}
+    def refresh_status(
+        self,
+        settings: list[TuningValue],
+        gate: Callable[[str], str | None],
+        telemetry: Telemetry,
+        history: dict[str, deque[float]],
+    ) -> None:
+        by_key = {setting.key: setting for setting in settings}
 
-        def value(key: str):
-            result = values.get(key)
-            return "—" if result is None else result
+        def preview(key: str) -> int | None:
+            setting = by_key.get(key)
+            return None if setting is None else setting.value
 
+        def planned(key: str) -> int | None:
+            """The preview, but only when the selected modes would write it."""
+            return None if gate(key) is not None else preview(key)
+
+        def shown(number: object, unit: str = "") -> str:
+            return "—" if number is None else f"{number}{unit}"
+
+        for name, trend in history.items():
+            self.query_one(f"#{name.replace('_', '-')}-trend", Sparkline).data = list(trend)
+
+        # A target is only a target when the mode that writes it is selected.
+        cpu_targets = []
+        intel_offset = planned("intel-thermal-offset")
+        if type(intel_offset) is int:
+            cpu_targets.append((100 + intel_offset, "Intel preview"))
+        lenovo_cpu = planned("lenovo-cpu-temperature-target")
+        if type(lenovo_cpu) is int:
+            cpu_targets.append((lenovo_cpu, "Lenovo preview"))
+        cpu_target = min(cpu_targets) if cpu_targets else None
         cpu_temp = telemetry.cpu_temperature
-        gpu_temp = telemetry.gpu_temperature
-        intel_offset = values.get('intel-thermal-offset')
-        intel_target = f"{100 + intel_offset}°C (offset {intel_offset})" if type(intel_offset) is int else "unverified"
         self.query_one("#cpu-thermal", Static).update(
-            f"CPU THERMAL  {cpu_temp:.0f}°C\nIntel thermal target (preview): {intel_target}"
+            f"CPU THERMAL  {cpu_temp:.0f}°C\n"
+            f"{Telemetry.bar(cpu_temp, cpu_target[0] if cpu_target else 100)}\n"
+            + (f"Target {cpu_target[0]}°C ({cpu_target[1]})" if cpu_target else "No target set · scale 100°C")
             if cpu_temp is not None
             else "CPU THERMAL\nNo sensor reading"
         )
-        headroom = "Unavailable" if telemetry.gpu_headroom is None else f"{telemetry.gpu_headroom:+.0f}°C"
+
+        gpu_temp = telemetry.gpu_temperature
+        gpu_targets = []
+        if gpu_temp is not None and telemetry.gpu_headroom is not None:
+            gpu_targets.append((round(gpu_temp + telemetry.gpu_headroom), "driver slowdown"))
+        lenovo_gpu = planned("lenovo-gpu-temperature-target")
+        if type(lenovo_gpu) is int:
+            gpu_targets.append((lenovo_gpu, "Lenovo preview"))
+        gpu_target = min(gpu_targets) if gpu_targets else None
+        headroom = "—" if telemetry.gpu_headroom is None else f"{telemetry.gpu_headroom:+.0f}°C"
         self.query_one("#gpu-thermal", Static).update(
-            f"GPU THERMAL  {gpu_temp:.0f}°C\nDriver thermal margin: {headroom}\n{telemetry.gpu_reasons}"
+            f"GPU THERMAL  {gpu_temp:.0f}°C · margin {headroom}\n"
+            f"{Telemetry.bar(gpu_temp, gpu_target[0] if gpu_target else 90)}\n"
+            + (f"Target {gpu_target[0]}°C ({gpu_target[1]})" if gpu_target else "No target set · scale 90°C")
+            + f"\n{telemetry.gpu_reasons}"
             if gpu_temp is not None
             else "GPU THERMAL\nNo sensor reading"
         )
+
         gpu_power_limit = telemetry.gpu_power_limit
         self.query_one("#gpu-power", Static).update(
             f"GPU POWER {telemetry.gpu_power:.0f} / {gpu_power_limit:.0f} W live\n"
             f"{Telemetry.bar(telemetry.gpu_power, gpu_power_limit)}\n"
-            f"Utilization: {telemetry.gpu_utilization if telemetry.gpu_utilization is not None else '—'}%"
+            f"Utilization: {shown(telemetry.gpu_utilization)}%"
             if telemetry.gpu_power is not None and gpu_power_limit is not None
             else "GPU POWER\nNo live power reading"
         )
-        gpu_clock = "—" if telemetry.gpu_clock is None else f"{telemetry.gpu_clock:.0f} MHz"
-        gpu_memory = "—" if telemetry.gpu_memory_clock is None else f"{telemetry.gpu_memory_clock:.0f} MHz"
+
         turbo = (
             "Allowed" if telemetry.turbo_enabled is True else
             "Disabled" if telemetry.turbo_enabled is False else
@@ -649,41 +949,202 @@ class StatusRail(VerticalScroll):
         self.query_one("#clock-readout", Static).update(
             f"Turbo: {turbo}\n{telemetry.cpu_policies}\n{telemetry.cpu_boost}"
         )
-        def mhz(number):
+        self.query_one("#intel-readout", Static).update(telemetry.intel_limits)
+
+        def mhz(number: float | None) -> str:
             return "—" if number is None else f"{number:.0f}"
+
         self.query_one("#gpu-readout", Static).update(
-            f"Core now: {gpu_clock}\nVRAM now: {gpu_memory}\n"
+            f"Core now: {mhz(telemetry.gpu_clock)} MHz\nVRAM now: {mhz(telemetry.gpu_memory_clock)} MHz\n"
             f"Driver max core: {mhz(telemetry.gpu_max_clock)} MHz\n"
             f"Driver max VRAM: {mhz(telemetry.gpu_max_memory)} MHz\n"
             "Active clock locks: unverified"
         )
-        self.query_one("#limit-readout", Static).update(
-            f"P: {value('cpu-p-core-minimum-frequency')}–{value('cpu-p-core-maximum-frequency')} MHz\n"
-            f"E: {value('cpu-e-core-minimum-frequency')}–{value('cpu-e-core-maximum-frequency')} MHz\n"
-            f"Core lock  {value('nvidia-core-clock-minimum')}–{value('nvidia-core-clock-maximum')} MHz\n"
-            f"VRAM lock  {value('nvidia-memory-clock-minimum')}–{value('nvidia-memory-clock-maximum')} MHz\n"
-            f"GPU  {value('nvidia-power-ceiling')} W ceiling\n"
-            f"Lenovo PL1/PL2: {value('lenovo-cpu-sustained-limit')}/{value('lenovo-cpu-burst-limit')} W\n"
-            f"Intel PL1/PL2: {value('intel-pl1-sustained-power')}/{value('intel-pl2-burst-power')} W\n"
-            f"Intel thermal target: {intel_target} (preview, python undervolt --temp)\n"
-            f"Lenovo CPU/GPU targets: {value('lenovo-cpu-temperature-target')}/{value('lenovo-gpu-temperature-target')}°C\n"
-            "Firmware targets require Custom"
+
+        def plan_lines(label: str, keys: tuple[str, ...], unit: str, separator: str) -> list[str]:
+            """The planned value(s), and the reading they replace when edited."""
+            lines = [f"{label}: {separator.join(shown(preview(key)) for key in keys)}{unit}"]
+            if any(key in by_key and by_key[key].modified for key in keys):
+                was = separator.join(
+                    shown(by_key[key].live) if key in by_key else "—" for key in keys
+                )
+                lines.append(f"  was {was}{unit}")
+            return lines
+
+        limits: list[str] = []
+        cpu_groups_present: list[str] = []
+        for setting in settings:
+            match = re.fullmatch(r"cpu-(.+)-core-(?:minimum|maximum)-frequency", setting.key)
+            if match and match.group(1) not in cpu_groups_present:
+                cpu_groups_present.append(match.group(1))
+        for group in cpu_groups_present:
+            limits += plan_lines(
+                CPU_GROUP_LABELS.get(group, group.upper()),
+                (f"cpu-{group}-core-minimum-frequency", f"cpu-{group}-core-maximum-frequency"),
+                " MHz", "–",
+            )
+        limits += plan_lines("Core lock", ("nvidia-core-clock-minimum", "nvidia-core-clock-maximum"), " MHz", "–")
+        limits += plan_lines("VRAM lock", ("nvidia-memory-clock-minimum", "nvidia-memory-clock-maximum"), " MHz", "–")
+        limits += plan_lines("GPU ceiling", ("nvidia-power-ceiling",), " W", "")
+        limits += plan_lines("Lenovo PL1/PL2", ("lenovo-cpu-sustained-limit", "lenovo-cpu-burst-limit"), " W", "/")
+        limits += plan_lines("Intel PL1/PL2", ("intel-pl1-sustained-power", "intel-pl2-burst-power"), " W", "/")
+        offset = preview("intel-thermal-offset")
+        limits.append(
+            f"Intel target: {100 + offset}°C (offset {offset})" if type(offset) is int
+            else "Intel target: unverified"
         )
+        limits += plan_lines("Lenovo CPU/GPU targets", ("lenovo-cpu-temperature-target", "lenovo-gpu-temperature-target"), "°C", "/")
+        limits.append("Firmware targets require Custom")
+        self.query_one("#limit-readout", Static).update("\n".join(limits))
 
 
-class ApplyConfirmation(ModalScreen[bool]):
-    """Require a second, explicit action before modifying live hardware."""
+class TuningPlan(VerticalScroll):
+    """The editable plan; each mode selector sits above the rows it gates."""
+
+    def __init__(
+        self,
+        settings: list[TuningValue],
+        profiles: list[str],
+        options: dict[str, str],
+        *,
+        turbo_available: bool,
+    ) -> None:
+        super().__init__(id="tuning-plan")
+        self.settings = settings
+        self.profiles = profiles
+        self.options = options
+        self.turbo_available = turbo_available
+
+    def rows(self, prefix: str) -> list[ValueRow]:
+        if prefix == "nvidia-":
+            chosen = [s for s in self.settings if not s.key.startswith(("cpu-", "intel-", "lenovo-"))]
+        else:
+            chosen = [s for s in self.settings if s.key.startswith(prefix)]
+        return [ValueRow(setting) for setting in chosen]
+
+    def compose(self) -> ComposeResult:
+        yield Static("TUNING PLAN", id="plan-title")
+        yield Static("", id="notice")
+        yield Static("", id="activity")
+
+        yield Static("CPU POLICY", classes="group-title")
+        yield Label("Turbo · ceilings above base frequency require Turbo on", classes="control-label")
+        yield Select(
+            [("On", "on"), ("Off", "off")], value=self.options["turbo"], allow_blank=False,
+            id="turbo", disabled=not self.turbo_available, compact=True,
+        )
+        yield from self.rows("cpu-")
+
+        yield Static("INTEL PACKAGE LIMITS", classes="group-title")
+        yield Label("Apply mode · persistent config file or live MSR writes", classes="control-label")
+        yield Select(
+            [
+                ("Keep current Intel settings", "keep"),
+                ("Apply persistently via intel-undervolt", "apply"),
+                ("Apply live via Python undervolt", "undervolt"),
+            ],
+            value=self.options["intel-mode"], allow_blank=False, id="intel-mode", compact=True,
+        )
+        with Collapsible(title="About Intel limits", collapsed=True):
+            yield Static(INTEL_HELP)
+        yield from self.rows("intel-")
+
+        yield Static("LENOVO CUSTOM MODE", classes="group-title")
+        yield Label("Profile · firmware sliders apply only in Custom", classes="control-label")
+        yield Select(
+            [(profile, profile) for profile in self.profiles] or [("Unavailable", "unavailable")],
+            value=self.options["profile"], allow_blank=False, id="profile",
+            disabled=not self.profiles, compact=True,
+        )
+        yield from self.rows("lenovo-")
+
+        yield Static("NVIDIA GPU", classes="group-title")
+        for domain in ("core", "memory"):
+            yield Label(f"{domain.capitalize()} clocks · Locked enables the range below", classes="control-label")
+            with Horizontal(classes="mode-row"):
+                yield Select(
+                    [("Keep current mode", "keep"), ("Automatic / reset locks", "auto"), ("Locked to preview range", "locked")],
+                    value=self.options[f"{domain}-mode"], allow_blank=False, id=f"{domain}-mode", compact=True,
+                )
+                yield Button(f"Reset {domain} on Apply", id=f"reset-{domain}", compact=True)
+        yield from self.rows("nvidia-")
+
+        with Horizontal(id="workloads"):
+            yield Button("Stress CPU", id="stress-cpu")
+            yield Button("Stress GPU", id="stress-gpu")
+        with Horizontal(id="actions"):
+            yield Button("Restore saved", id="restore")
+            yield Button("Revert to live", id="revert")
+            yield Button("Apply", id="apply", variant="warning")
+        yield Static("APPLY COMMAND LOG", id="apply-log-title")
+        yield RichLog(id="apply-log", wrap=True, markup=False, max_lines=200)
+
+
+class ApplyConfirmation(ModalScreen[ApplyPlan | None]):
+    """Show exactly what will run, and require a second action to run it."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, plan: ApplyPlan, sudo_ok: bool = True) -> None:
+        super().__init__()
+        self.plan = plan
+        self.sudo_ok = sudo_ok
 
     def compose(self) -> ComposeResult:
         with Container(id="confirm-dialog"):
-            yield Static("Apply these preview values to live hardware?", id="confirm-text")
+            yield Static(
+                f"Apply {len(self.plan.commands)} command(s) to live hardware?", id="confirm-text"
+            )
+            if not self.sudo_ok:
+                yield Static(
+                    "sudo is not authenticated: these commands will fail until you run "
+                    "`sudo -v` in a terminal.",
+                    id="confirm-warning",
+                )
+            with VerticalScroll(id="confirm-commands"):
+                yield Static(
+                    "\n".join(render_command(arguments, input_text) for arguments, input_text in self.plan.commands)
+                    or "No commands planned.",
+                    markup=False,
+                )
             with Horizontal(classes="confirm-actions"):
                 yield Button("Cancel", id="cancel")
                 yield Button("Apply now", id="confirm", variant="error")
 
+    def on_mount(self) -> None:
+        self.query_one("#cancel", Button).focus()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         event.stop()
-        self.dismiss(event.button.id == "confirm")
+        self.dismiss(self.plan if event.button.id == "confirm" else None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class TunnerCommands(Provider):
+    """Expose the tuner's actions to the command palette (ctrl+p)."""
+
+    COMMANDS = (
+        ("Apply plan to hardware", "apply", "Review the planned commands, then confirm"),
+        ("Restore saved preview", "restore", "Load last-values.json into the plan"),
+        ("Revert to live values", "revert", "Discard every edit since startup or the last Apply"),
+        ("Toggle CPU stress", "stress('cpu')", "Start or stop the CPU workload"),
+        ("Toggle GPU stress", "stress('gpu')", "Start or stop the CUDA workload"),
+        ("Toggle live status pane", "toggle_rail", "Show or hide telemetry"),
+        ("Jump to apply log", "show_log", "Scroll to the latest Apply outcome"),
+    )
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, action, help_text in self.COMMANDS:
+            score = matcher.match(name)
+            if score > 0:
+                yield Hit(score, matcher.highlight(name), partial(self.app.run_action, action), help=help_text)
+
+    async def discover(self) -> Hits:
+        for name, action, help_text in self.COMMANDS:
+            yield DiscoveryHit(name, partial(self.app.run_action, action), help=help_text)
 
 
 class TunnerApp(App[None]):
@@ -691,113 +1152,163 @@ class TunnerApp(App[None]):
 
     TITLE = "Tunner"
     CSS = """
-    Screen { background: #101113; color: #e7e9ed; }
-    Header { background: #101113; color: #e7e9ed; }
-    Footer { background: #101113; color: #8e949f; }
+    Screen { background: $background; }
+    #status-strip { display: none; height: 1; padding: 0 2; color: $text-muted; background: $surface; }
+    Screen.narrow #status-strip, Screen.rail-hidden #status-strip { display: block; }
+    #loading { width: 1fr; height: 1fr; }
+    #probe-failure { width: 1fr; padding: 1 2; color: $error; }
     #workspace { width: 96%; max-width: 138; height: 1fr; margin: 1 2; }
     #tuning-plan { width: 1fr; padding-right: 2; }
-    #plan-title { color: #fbfbfc; text-style: bold; margin-bottom: 1; }
-    .group-title { color: #86b7ff; text-style: bold; margin: 1 0 0 0; }
-    #notice { color: #8e949f; margin-bottom: 1; }
-    #activity { color: #6ee7a8; margin-bottom: 1; }
-    .value-row { height: 3; align: center middle; border-bottom: solid #292c32; }
+    #plan-title { text-style: bold; }
+    #notice { color: $text-muted; margin-bottom: 1; }
+    #notice.warning { color: $warning; }
+    #activity { margin-bottom: 1; }
+    #activity.ok { color: $success; }
+    #activity.error { color: $error; }
+    #activity.warning { color: $warning; }
+    #activity.muted { color: $text-muted; }
+    .group-title { color: $primary; text-style: bold; margin-top: 1; }
+    .control-label { color: $text-muted; }
+    .mode-row { height: auto; }
+    .mode-row Select { width: 1fr; }
+    .mode-row Button { margin-left: 1; }
+    Collapsible { margin-bottom: 0; }
+    .value-row { height: 1; }
+    .value-row:focus-within { background: $boost; }
     .setting-name { width: 1fr; }
-    .range { width: 20; color: #8e949f; text-align: right; }
-    .value { width: 13; text-align: center; color: #fbfbfc; }
-    .step { min-width: 5; width: 5; background: #24272d; border: none; }
-    .step:focus { background: #3d4655; }
-    #actions { height: 3; margin-top: 1; }
-    #actions Button { margin-right: 1; }
-    #apply-log-title { color: #86b7ff; text-style: bold; margin-top: 1; }
-    #apply-log { height: 10; border: solid #303641; padding: 0 1; background: #181b20; }
-    #status-rail { width: 38; min-width: 34; height: 1fr; padding: 1 2; background: #181b20; border: solid #303641; }
-    Screen.narrow #status-rail { display: none; }
-    Screen.narrow #tuning-plan { padding-right: 0; }
+    .setting-name.modified { color: $warning; }
+    .range { width: 20; color: $text-muted; text-align: right; }
+    .range.hint { color: $text-disabled; }
+    .value { width: 13; }
+    .step { min-width: 5; width: 5; }
+    #workloads, #actions { height: auto; margin-top: 1; }
+    #workloads Button, #actions Button { margin-right: 1; }
+    #apply-log-title { color: $primary; text-style: bold; margin-top: 1; }
+    #apply-log { height: 10; border: solid $border-blurred; padding: 0 1; background: $surface; }
+    #apply-log:focus { border: solid $border; }
+    #status-rail { width: 38; min-width: 34; height: 1fr; padding: 1 2; background: $panel; border: solid $border-blurred; }
+    Screen.narrow #status-rail, Screen.rail-hidden #status-rail { display: none; }
+    Screen.narrow #tuning-plan, Screen.rail-hidden #tuning-plan { padding-right: 0; }
+    Screen.rail-only #tuning-plan { display: none; }
+    Screen.rail-only #status-rail { width: 1fr; }
     Screen.compact .range { display: none; }
-    Screen.compact .value-row { height: 4; }
-    .panel-title { color: #fbfbfc; text-style: bold; }
-    .panel-subtitle { color: #8e949f; margin-bottom: 1; }
-    .metric { color: #d9e1ea; padding: 0; margin-top: 1; border-bottom: solid #303641; }
-    .section-title { color: #86b7ff; text-style: bold; margin-top: 1; }
-    .readout { color: #c0c7d1; margin-top: 1; }
-    .panel-note { color: #8e949f; margin-top: 1; }
-    ApplyConfirmation { align: center middle; background: #00000099; }
-    #confirm-dialog { width: 52; height: auto; padding: 1 2; background: #1b1e24; border: solid #4b5563; }
-    #confirm-text { margin-bottom: 1; }
-    .confirm-actions { height: 3; }
+    .panel-title { text-style: bold; }
+    .panel-subtitle { color: $text-muted; margin-bottom: 1; }
+    .metric { margin-top: 1; }
+    .trend { height: 1; }
+    .section-title { color: $primary; text-style: bold; margin-top: 1; }
+    .readout { color: $foreground-muted; }
+    .panel-note { color: $text-muted; margin-top: 1; }
+    ApplyConfirmation { align: center middle; background: $background 60%; }
+    #confirm-dialog { width: 90%; max-width: 100; height: auto; max-height: 90%; padding: 1 2; background: $panel; border: solid $border; }
+    #confirm-text { margin-bottom: 1; text-style: bold; }
+    #confirm-warning { color: $warning; margin-bottom: 1; }
+    #confirm-commands { height: auto; max-height: 20; border: solid $border-blurred; padding: 0 1; margin-bottom: 1; }
+    .confirm-actions { height: auto; }
     .confirm-actions Button { margin-right: 1; }
     """
-    BINDINGS = [("q", "quit", "Quit")]
+    BINDINGS = [
+        Binding("a", "apply", "Apply"),
+        Binding("r", "restore", "Restore"),
+        Binding("v", "revert", "Revert all", show=False),
+        Binding("c", "stress('cpu')", "Stress CPU", show=False),
+        Binding("g", "stress('gpu')", "Stress GPU", show=False),
+        Binding("t", "toggle_rail", "Status"),
+        Binding("l", "show_log", "Log", show=False),
+        Binding("q", "quit", "Quit"),
+    ]
+    COMMANDS = App.COMMANDS | {TunnerCommands}
 
     def __init__(self) -> None:
         super().__init__()
-        self.settings = load_values() + cpu_clock_values() + nvidia_clock_values() + intel_values()
-        self.nvidia_power_limit_available = nvidia_power_limit_available()
+        self.settings: list[TuningValue] = []
+        self.cpu_groups: dict[str, list[Path]] = {}
+        self.nvidia_power_limit_available = False
+        self.profiles: list[str] = []
+        self.options = {"profile": "unavailable", "turbo": "off",
+                        "core-mode": "keep", "memory-mode": "keep", "intel-mode": "keep"}
+        self.plan: TuningPlan | None = None
         self.stress_processes: dict[str, subprocess.Popen[str]] = {}
         self.last_change: datetime | None = None
         self.last_apply: datetime | None = None
-        # (when, text, colour) of the last one-off message; it stays on screen
+        # (when, text, tone) of the last one-off message; it stays on screen
         # until a newer preview change, apply, or message replaces it.
         self.activity_message: tuple[datetime, str, str] | None = None
-        try:
-            self.profiles = Path('/sys/firmware/acpi/platform_profile_choices').read_text().split()
-            profile = Path('/sys/firmware/acpi/platform_profile').read_text().strip()
-        except OSError:
-            self.profiles, profile = [], "unavailable"
-        self.options = {"profile": profile, "turbo": "on" if turbo_state() else "off",
-                        "core-mode": "keep", "memory-mode": "keep", "intel-mode": "keep"}
+        self.telemetry = Telemetry()
+        self.history: dict[str, deque[float]] = {
+            name: deque(maxlen=HISTORY_LENGTH)
+            for name in ("cpu_temperature", "gpu_temperature", "gpu_power", "gpu_clock")
+        }
+        self.applying = False
+        self.save_timer: Timer | None = None
+        # Wide terminals: the pane can be hidden. Narrow ones: it can replace
+        # the plan instead of disappearing.
+        self.rail_visible = True
+        self.narrow_rail = False
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
+        yield Header(show_clock=True)
+        yield Static("", id="status-strip")
         with Horizontal(id="workspace"):
-            with VerticalScroll(id="tuning-plan"):
-                yield Static("TUNING PLAN", id="plan-title")
-                yield Static(
-                    "Adjust the intended limits below. Live status appears alongside on wider terminals.",
-                    id="notice",
-                )
-                yield Static("", id="activity")
-                yield Label("Intel package limits · persistent configuration")
-                yield Select([('Keep current Intel settings', 'keep'), ('Apply persistently via intel-undervolt', 'apply'), ('Apply live via Python undervolt', 'undervolt')], value='keep', allow_blank=False, id='intel-mode')
-                yield Static('Intel windows use milliseconds (1000 ms = 1 s), not exact boost timers. Thermal offset is relative to 100°C on this CPU. Persistent apply updates /etc/intel-undervolt.conf and reapplies its existing voltage offsets. Python undervolt writes only these live limits through MSRs and does not persist them. UI bounds are app limits, not hardware guarantees.')
-                yield Label("Lenovo profile · firmware sliders apply only in Custom")
-                yield Select([(p, p) for p in self.profiles] or [("Unavailable", "unavailable")], value=self.options['profile'], allow_blank=False, id="profile", disabled=not self.profiles)
-                yield Label("CPU Turbo · ceilings above base require Turbo on")
-                yield Select([("On", "on"), ("Off", "off")], value=self.options['turbo'], allow_blank=False, id="turbo", disabled=turbo_state() is None)
-                for domain in ("core", "memory"):
-                    yield Label(f"GPU {domain} clocks")
-                    yield Select([("Keep current mode", "keep"), ("Automatic / reset locks", "auto"), ("Locked to preview range", "locked")], value="keep", allow_blank=False, id=f"{domain}-mode")
-                    yield Button(f"Reset {domain} clocks on Apply", id=f"reset-{domain}")
-                previous_group = ""
-                for setting in self.settings:
-                    group = (
-                        "Intel package limits" if setting.key.startswith("intel-") else
-                        "CPU policy" if setting.key.startswith("cpu-") else
-                        "Lenovo Custom Mode" if setting.key.startswith("lenovo-") else
-                        "NVIDIA GPU"
-                    )
-                    if group != previous_group:
-                        yield Static(group.upper(), classes="group-title")
-                        previous_group = group
-                    yield ValueRow(setting)
-                with Horizontal(id="actions"):
-                    yield Button("Stress CPU", id="stress-cpu", variant="warning")
-                    yield Button("Stress GPU", id="stress-gpu", variant="warning")
-                    yield Button("Restore saved", id="restore")
-                    yield Button("Apply", id="apply", variant="error")
-                yield Static("APPLY COMMAND LOG", id="apply-log-title")
-                yield RichLog(id="apply-log", wrap=True, markup=False, max_lines=200)
+            yield LoadingIndicator(id="loading")
             yield StatusRail(id="status-rail")
         yield Footer()
 
     def on_mount(self) -> None:
         self.update_layout(self.size.width)
+        self.probe_hardware()
+
+    @work(exclusive=True, group="probe", exit_on_error=False)
+    async def probe_hardware(self) -> None:
+        """Read hardware off the event loop, then build the plan from it."""
+        failure = None
+        try:
+            probe = await asyncio.to_thread(probe_system)
+        except Exception as error:
+            # Nothing was read, sudo included, so the plan starts empty and
+            # the notice must not claim that sudo failed.
+            probe = Probe([], {}, False, [], "unavailable", None, None)
+            failure = describe_error(error)
+        try:
+            await self.finish_probe(probe)
+        except Exception as error:
+            # The worker swallows errors, so an endless spinner would be the
+            # only symptom; put the reason where the plan should have been.
+            failure = describe_error(error)
+            await self.query("#loading").remove()
+            await self.query_one("#workspace").mount(
+                Static(f"Could not build the plan: {failure}\nPress q to quit.", id="probe-failure"),
+                before=self.query_one(StatusRail),
+            )
+        if failure is None:
+            return
+        if self.plan_ready:
+            self.show_activity(f"● Hardware probe failed: {failure}", "error")
+        self.notify(f"Hardware probe failed: {failure}", severity="error", timeout=10)
+
+    async def finish_probe(self, probe: Probe) -> None:
+        self.settings = probe.settings
+        self.cpu_groups = probe.cpu_groups
+        self.nvidia_power_limit_available = probe.nvidia_power_limit_available
+        self.profiles = probe.profiles
+        self.options["profile"] = probe.profile
+        self.options["turbo"] = "on" if probe.turbo else "off"
+        await self.query_one("#loading").remove()
+        plan = TuningPlan(self.settings, self.profiles, self.options, turbo_available=probe.turbo is not None)
+        await self.query_one("#workspace").mount(plan, before=self.query_one(StatusRail))
+        self.plan = plan
+        self.update_sudo_notice(probe.sudo_ready)
         self.populate_live_intel_values()
         self.update_row_disabled_state()
         self.refresh_telemetry()
         self.refresh_activity()
+        self.refresh_status_rail()
         self.set_interval(2, self.refresh_telemetry)
         self.set_interval(1, self.refresh_activity)
+
+    @property
+    def plan_ready(self) -> bool:
+        return self.plan is not None
 
     def on_resize(self, event: Resize) -> None:
         self.update_layout(event.size.width)
@@ -805,27 +1316,74 @@ class TunnerApp(App[None]):
     def update_layout(self, width: int) -> None:
         # Reserve room for setting names as well as the 43-column controls.
         # The tuning screen stays at the bottom when confirmation is open.
-        tuning_screen = self.screen_stack[0]
-        tuning_screen.set_class(width < 120, "narrow")
-        tuning_screen.set_class(width < 80, "compact")
+        screen = self.screen_stack[0]
+        narrow = width < NARROW_WIDTH
+        screen.set_class(narrow and not self.narrow_rail, "narrow")
+        screen.set_class(narrow and self.narrow_rail, "rail-only")
+        screen.set_class(not narrow and not self.rail_visible, "rail-hidden")
+        screen.set_class(width < COMPACT_WIDTH, "compact")
+
+    def action_toggle_rail(self) -> None:
+        if self.size.width < NARROW_WIDTH:
+            self.narrow_rail = not self.narrow_rail
+        else:
+            self.rail_visible = not self.rail_visible
+        self.update_layout(self.size.width)
+
+    def action_show_log(self) -> None:
+        if not self.plan_ready:
+            return
+        if self.narrow_rail:
+            self.narrow_rail = False
+            self.update_layout(self.size.width)
+        apply_log = self.query_one("#apply-log", RichLog)
+        apply_log.scroll_visible()
+        apply_log.focus()
+
+    def update_sudo_notice(self, ready: bool | None) -> None:
+        """Warn only when sudo was actually checked and has no cached credentials."""
+        notice = self.query_one("#notice", Static)
+        notice.set_class(ready is False, "warning")
+        notice.update(
+            "sudo is not authenticated: run `sudo -v` in a terminal before Apply, or every command will fail."
+            if ready is False
+            else "Tab to a value, type it or press ↑/↓ (shift for ×10); ctrl+p lists every command."
+        )
 
     def on_value_row_changed(self, event: ValueRow.Changed) -> None:
         self.last_change = datetime.now()
-        write_last_values(self.settings, options=self.options)
+        self.schedule_save()
         self.refresh_activity()
-        self.refresh_telemetry()
+        self.refresh_status_rail()
+
+    def schedule_save(self) -> None:
+        """Coalesce a burst of edits into one write of last-values.json."""
+        if self.save_timer is not None:
+            self.save_timer.stop()
+        self.save_timer = self.set_timer(SAVE_DELAY, self.flush_save)
+
+    def flush_save(self) -> None:
+        if self.save_timer is not None:
+            self.save_timer.stop()
+            self.save_timer = None
+        write_last_values(self.settings, options=self.options)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id in ("stress-cpu", "stress-gpu"):
-            self.toggle_stress(event.button.id.removeprefix("stress-"))
-            return
-        if event.button.id in ("reset-core", "reset-memory"):
-            domain = event.button.id.removeprefix("reset-")
-            self.query_one(f"#{domain}-mode", Select).value = "auto"
-        if event.button.id == "restore":
-            self.restore_saved()
-        elif event.button.id == "apply":
-            self.push_screen(ApplyConfirmation(), self.apply_confirmed)
+        button_id = event.button.id or ""
+        if button_id.startswith("stress-"):
+            self.toggle_stress(button_id.removeprefix("stress-"))
+        elif button_id.startswith("reset-"):
+            self.query_one(f"#{button_id.removeprefix('reset-')}-mode", Select).value = "auto"
+        elif button_id == "restore":
+            self.action_restore()
+        elif button_id == "revert":
+            self.action_revert()
+        elif button_id == "apply":
+            self.action_apply()
+
+    def action_stress(self, target: str) -> None:
+        if self.plan_ready and target in ("cpu", "gpu"):
+            self.toggle_stress(target)
 
     def toggle_stress(self, target: str) -> None:
         """Launch or stop an isolated opt-in workload without blocking the TUI."""
@@ -849,7 +1407,7 @@ class TunnerApp(App[None]):
             start_new_session=True,
         )
         button.label = f"Stop {target.upper()} stress"
-        self.show_activity(f"● {target.upper()} stress started; click again to stop")
+        self.show_activity(f"● {target.upper()} stress started; press again to stop")
 
     def refresh_stress_processes(self) -> bool:
         """Reap finished workloads and report failures instead of leaving stale UI."""
@@ -865,16 +1423,18 @@ class TunnerApp(App[None]):
             if returncode != 0:
                 detail = stderr.splitlines()[-1] if stderr else f"exit status {returncode}"
                 message = f"{target.upper()} stress failed: {detail}"
-                self.show_activity(f"● {message}", "#ff6b6b")
+                self.show_activity(f"● {message}", "error")
                 self.notify(message, severity="error", timeout=10)
                 failure_reported = True
         return failure_reported
 
     def on_unmount(self) -> None:
-        """Never leave stress processes running after the tuner exits."""
+        """Never leave stress processes running or an edit unsaved after exit."""
         for process in self.stress_processes.values():
             if process.poll() is None:
                 self.stop_stress(process)
+        if self.save_timer is not None:
+            self.flush_save()
 
     @classmethod
     def stop_stress(cls, process: subprocess.Popen[str]) -> None:
@@ -924,29 +1484,29 @@ class TunnerApp(App[None]):
             process.stderr.close()
         return b"".join(chunks).decode(errors="replace").strip()
 
+    def gate(self, key: str) -> str | None:
+        """Why the selected modes would not write `key`; None when they would."""
+        return gate_hint(key, self.options, self.nvidia_power_limit_available)
+
     def update_row_disabled_state(self) -> None:
+        """Disable rows their mode selector does not apply, and say why."""
         for row in self.query(ValueRow):
-            if row.setting.key.startswith('intel-'):
-                row.disabled = self.options['intel-mode'] == 'keep'
-            elif row.setting.key.startswith("lenovo-"):
-                row.disabled = self.options['profile'] != 'custom'
-            elif row.setting.key.startswith("nvidia-core-clock"):
-                row.disabled = self.options['core-mode'] != 'locked'
-            elif row.setting.key.startswith("nvidia-memory-clock"):
-                row.disabled = (
-                    self.options['memory-mode'] != 'locked'
-                    or (row.setting.value is None and row.setting.unavailable_reason is not None)
-                )
+            key = row.setting.key
+            unavailable = row.setting.value is None and row.setting.unavailable_reason is not None
+            row.hint = self.gate(key)
+            row.disabled = row.hint is not None or (key.startswith("nvidia-memory-clock") and unavailable)
+            row.refresh_value()
 
     def on_select_changed(self, event: Select.Changed) -> None:
         key = event.select.id
         if key in self.options and isinstance(event.value, str) and self.options[key] != event.value:
             self.options[key] = event.value
-            if key == 'intel-mode':
+            if key == "intel-mode":
                 self.populate_live_intel_values()
-            write_last_values(self.settings, options=self.options)
             self.last_change = datetime.now()
+            self.schedule_save()
         self.update_row_disabled_state()
+        self.refresh_status_rail()
 
     def populate_live_intel_values(self) -> None:
         """Give Intel rows without a persistent config a live starting value.
@@ -957,29 +1517,78 @@ class TunnerApp(App[None]):
         had to be clamped into the spec is shown with its raw value in place
         of the range.
         """
-        if self.options['intel-mode'] != 'undervolt':
+        if self.options["intel-mode"] != "undervolt":
             return
-        values, notes = intel_controls.live_control_state(load_last_values())
+        values, notes = intel_controls.live_control_state(load_saved_state()[0])
         for row in self.query(ValueRow):
             key = row.setting.key
             if key not in values or row.setting.value is not None:
                 continue
-            row.setting.value = values[key]
+            row.setting.value = row.setting.live = values[key]
             row.setting.unavailable_reason = None
             row.setting.note = notes.get(key)
             row.refresh_value()
 
-    def show_activity(self, text: str, color: str = "#6ee7a8") -> None:
+    def show_activity(self, text: str, tone: str = "ok") -> None:
         """Show a one-off message and keep it until something newer happens."""
-        self.activity_message = (datetime.now(), text, color)
+        self.activity_message = (datetime.now(), text, tone)
+        self.set_activity(text, tone)
+
+    def set_activity(self, text: str, tone: str) -> None:
         activity = self.query_one("#activity", Static)
-        activity.styles.color = color
+        for name in TONES:
+            activity.set_class(name == tone, name)
         activity.update(text)
 
+    @work(thread=True, exclusive=True, group="telemetry", exit_on_error=False)
     def refresh_telemetry(self) -> None:
+        """Poll sensors off the event loop so a slow driver never freezes input."""
         if not self.is_running:
-            return  # Shutdown prunes the screen before it stops this timer.
-        self.query_one(StatusRail).refresh_status(self.settings, read_telemetry())
+            return
+        worker = get_current_worker()
+        telemetry = read_telemetry(self.cpu_groups)
+        # A thread cannot be stopped, only superseded: a poll that outlived
+        # the next tick must not overwrite that tick's fresher sample.
+        if worker.is_cancelled:
+            return
+        try:
+            self.call_from_thread(self.apply_telemetry, telemetry)
+        except RuntimeError:
+            pass  # The app stopped while this poll was in flight.
+
+    def apply_telemetry(self, telemetry: Telemetry) -> None:
+        if not self.is_running:
+            return
+        self.telemetry = telemetry
+        for name, trend in self.history.items():
+            reading = getattr(telemetry, name)
+            if reading is not None:
+                trend.append(float(reading))
+        self.refresh_status_rail()
+
+    def refresh_status_rail(self) -> None:
+        if not self.is_running:
+            return  # Shutdown prunes the screen before it stops the timers.
+        self.query_one(StatusRail).refresh_status(self.settings, self.gate, self.telemetry, self.history)
+        self.query_one("#status-strip", Static).update(self.status_strip_text())
+
+    def status_strip_text(self) -> str:
+        """The live essentials for when the status pane is hidden: one line."""
+        telemetry = self.telemetry
+        parts = [
+            "CPU —" if telemetry.cpu_temperature is None else f"CPU {telemetry.cpu_temperature:.0f}°C",
+            "GPU —" if telemetry.gpu_temperature is None else f"GPU {telemetry.gpu_temperature:.0f}°C",
+        ]
+        if telemetry.gpu_power is not None and telemetry.gpu_power_limit is not None:
+            parts.append(f"{telemetry.gpu_power:.0f}/{telemetry.gpu_power_limit:.0f} W")
+        if telemetry.gpu_clock is not None:
+            parts.append(f"GPU {telemetry.gpu_clock:.0f} MHz")
+        if telemetry.cpu_clock is not None:
+            parts.append(f"CPU avg {telemetry.cpu_clock} MHz")
+        parts.append("profile " + (telemetry.profile or "?"))
+        turbo = telemetry.turbo_enabled
+        parts.append("turbo " + ("on" if turbo else "off" if turbo is False else "?"))
+        return " · ".join(parts)
 
     def refresh_activity(self) -> None:
         """Render the newest of: a one-off message, the last apply, the last change.
@@ -987,10 +1596,9 @@ class TunnerApp(App[None]):
         On an exact timestamp tie a message beats an apply, which beats a
         change, matching the order in which the code records them.
         """
-        if not self.is_running:
+        if not self.is_running or not self.plan_ready:
             return  # Shutdown prunes the screen before it stops this timer.
         self.refresh_stress_processes()
-        activity = self.query_one("#activity", Static)
         events: list[tuple[datetime, int, str]] = []
         if self.activity_message is not None:
             events.append((self.activity_message[0], 2, "message"))
@@ -999,40 +1607,45 @@ class TunnerApp(App[None]):
         if self.last_change is not None:
             events.append((self.last_change, 0, "change"))
         if not events:
-            activity.styles.color = "#8e949f"
-            activity.update("○ No preview change in this session")
+            self.set_activity("○ No preview change in this session", "muted")
             return
         when, _, kind = max(events)
         age = datetime.now() - when
         recent = age < timedelta(seconds=5)
         if kind == "message":
-            _, text, color = self.activity_message
-            activity.styles.color = color
-            activity.update(text)
+            _, text, tone = self.activity_message
+            self.set_activity(text, tone)
         elif kind == "apply":
-            activity.styles.color = "#6ee7a8"
-            activity.update(
+            self.set_activity(
                 "● Applied successfully just now — saved to last-values.json"
                 if recent
-                else f"● Applied successfully {int(age.total_seconds())}s ago"
+                else f"● Applied successfully {int(age.total_seconds())}s ago",
+                "ok",
             )
         elif recent:
-            activity.styles.color = "#6ee7a8"
-            activity.update("● Changed just now — saved to last-values.json")
+            self.set_activity("● Changed just now — saved to last-values.json", "ok")
         else:
-            activity.styles.color = "#8e949f"
-            activity.update(f"● Last preview change {int(age.total_seconds())}s ago")
+            self.set_activity(f"● Last preview change {int(age.total_seconds())}s ago", "muted")
+
+    def action_restore(self) -> None:
+        if self.plan_ready and not self.applying:
+            self.restore_saved()
 
     def restore_saved(self) -> None:
-        saved = load_last_values()
-        try:
-            options = json.loads(LAST_VALUES.read_text(encoding="utf-8")).get('options', {})
-            for key, allowed in {'intel-mode': ['keep', 'apply', 'undervolt'], 'profile': self.profiles, 'turbo': ['on', 'off'], 'core-mode': ['keep', 'auto', 'locked'], 'memory-mode': ['keep', 'auto', 'locked']}.items():
-                if options.get(key) in allowed:
-                    self.query_one(f'#{key}', Select).value = options[key]
-                    self.options[key] = options[key]
-        except (OSError, ValueError, AttributeError):
-            pass
+        if self.save_timer is not None:
+            self.flush_save()
+        saved, options = load_saved_state()
+        allowed = {
+            "intel-mode": ["keep", "apply", "undervolt"],
+            "profile": self.profiles,
+            "turbo": ["on", "off"],
+            "core-mode": ["keep", "auto", "locked"],
+            "memory-mode": ["keep", "auto", "locked"],
+        }
+        for key, choices in allowed.items():
+            if options.get(key) in choices:
+                self.query_one(f"#{key}", Select).value = options[key]
+                self.options[key] = options[key]
         # Modes first, so live Intel values back a restored undervolt mode.
         self.populate_live_intel_values()
         restored = 0
@@ -1041,7 +1654,7 @@ class TunnerApp(App[None]):
             if value is None:
                 continue
             if setting.value is None:
-                if setting.key.startswith('intel-'):
+                if setting.key.startswith("intel-"):
                     # The spec bounds are known even without a config file,
                     # so a saved value inside them is a valid preview.
                     if not intel_controls.in_spec(setting.key, value):
@@ -1057,27 +1670,70 @@ class TunnerApp(App[None]):
                     setting.unavailable_reason = "saved value; live clock query failed"
             else:
                 setting.value = max(setting.minimum, min(setting.maximum, value))
-            row = next(
-                row for row in self.query(ValueRow) if row.setting.key == setting.key
-            )
-            row.refresh_value()
             restored += 1
         self.update_row_disabled_state()
         self.last_change = datetime.now()
         self.show_activity(
             f"● Restored {restored} saved preview value(s); press Apply to set hardware"
         )
-        self.refresh_telemetry()
+        self.refresh_status_rail()
 
-    def apply_confirmed(self, approved: bool | None) -> None:
-        if not approved:
+    def action_revert(self) -> None:
+        """Put every editable row back to the value it started from."""
+        if not self.plan_ready or self.applying:
             return
+        reverted = sum(row.revert() for row in self.query(ValueRow))
+        if reverted:
+            self.last_change = datetime.now()
+            self.schedule_save()
+        self.show_activity(f"● Reverted {reverted} value(s) to the live reading")
+        self.refresh_status_rail()
+
+    def set_apply_controls(self, enabled: bool) -> None:
+        for selector in ("#apply", "#restore", "#revert"):
+            self.query_one(selector, Button).disabled = not enabled
+
+    def action_apply(self) -> None:
+        """Plan first, so a rejected plan is reported without a dialog."""
+        if not self.plan_ready or self.applying or isinstance(self.screen, ApplyConfirmation):
+            return
+        for row in self.query(ValueRow):
+            row.commit_input()
         apply_log = self.query_one("#apply-log", RichLog)
-        apply_log.clear()
-        command_failure_logged = False
         try:
-            commands = self.apply_commands()
-            for arguments, input_text in commands:
+            plan = self.apply_commands()
+        except Exception as error:
+            # A programming error while planning lands in the log too.
+            detail = describe_error(error)
+            apply_log.clear()
+            self.log_apply("FAILED", f"Apply could not start: {detail}")
+            apply_log.scroll_visible()
+            self.show_activity(f"● Apply failed: {detail}", "error")
+            self.notify(f"Apply not started: {detail}", severity="error", timeout=10)
+            return
+        self.confirm_apply(plan)
+
+    @work(exclusive=True, group="confirm", exit_on_error=False)
+    async def confirm_apply(self, plan: ApplyPlan) -> None:
+        """Check sudo off the loop, then show the plan for its second action."""
+        ready = await asyncio.to_thread(sudo_ready)
+        self.update_sudo_notice(ready)
+        self.push_screen(ApplyConfirmation(plan, ready), self.apply_confirmed)
+
+    def apply_confirmed(self, plan: ApplyPlan | None) -> None:
+        if plan is None or self.applying:
+            return
+        # Flagged here, on the loop, so a second Apply cannot slip in before
+        # the worker's first message lands.
+        self.begin_apply()
+        self.run_apply(plan)
+
+    @work(thread=True, group="apply", exit_on_error=False)
+    def run_apply(self, plan: ApplyPlan) -> None:
+        """Run the confirmed plan off the event loop, reporting each command."""
+        failure: str | None = None
+        try:
+            for arguments, input_text in plan.commands:
                 rendered = render_command(arguments, input_text)
                 try:
                     result = run_command(
@@ -1090,99 +1746,148 @@ class TunnerApp(App[None]):
                         timeout=30,
                     )
                 except (OSError, subprocess.SubprocessError) as error:
-                    first, *rest = failure_lines(error)
-                    apply_log.write(f"FAILED   {rendered}: {first}")
-                    for line in rest:
-                        apply_log.write(f"         {line}")
-                    command_failure_logged = True
-                    raise
-                apply_log.write(f"APPLIED  {rendered}")
+                    lines = failure_lines(error)
+                    first, *rest = lines
+                    self.call_from_thread(self.log_apply, "FAILED", f"{rendered}: {first}", rest)
+                    failure = lines[-1]
+                    break
                 # Show what the command reported (nvidia-smi confirms the new
                 # limit, the Intel helper names its backup), but not tee's
                 # echo of the value it was given.
                 echoed = (input_text or "").strip()
-                for line in (result.stdout or "").splitlines():
-                    if line.strip() and line.strip() != echoed:
-                        apply_log.write(f"         {line.strip()}")
-        # Anything, including a programming error while building the plan,
-        # must land in the log rather than tear down the app mid-apply.
+                details = [
+                    line.strip() for line in (result.stdout or "").splitlines()
+                    if line.strip() and line.strip() != echoed
+                ]
+                self.call_from_thread(self.log_apply, "APPLIED", rendered, details)
         except Exception as error:
-            if not command_failure_logged:
-                apply_log.write(f"FAILED   Apply could not start: {describe_error(error)}")
-            detail = failure_lines(error)[-1]
-            self.show_activity(
-                f"● Apply failed: {detail}. Run 'sudo -v' in the terminal, then retry.",
-                "#ff6b6b",
-            )
-            return
-        write_last_values(self.settings, applied=True, options=self.options)
-        self.last_change = self.last_apply = datetime.now()
-        self.refresh_activity()
-        self.refresh_telemetry()
+            # Anything unexpected must land in the log rather than tear down
+            # the app mid-apply.
+            failure = describe_error(error)
+            self.call_from_thread(self.log_apply, "FAILED", f"Apply aborted: {failure}")
+        self.call_from_thread(self.finish_apply, failure, plan.values)
 
-    def apply_commands(self) -> list[tuple[list[str], str | None]]:
+    def begin_apply(self) -> None:
+        self.applying = True
+        self.set_apply_controls(False)
+        self.query_one("#apply-log", RichLog).clear()
+        self.show_activity("● Applying…", "muted")
+
+    def log_apply(self, kind: str, text: str, details: list[str] | tuple[str, ...] = ()) -> None:
+        apply_log = self.query_one("#apply-log", RichLog)
+        style = "bold green" if kind == "APPLIED" else "bold red"
+        apply_log.write(Text.assemble((f"{kind:<8} ", style), text))
+        for line in details:
+            apply_log.write(f"         {line}")
+
+    def finish_apply(self, failure: str | None, applied: dict[str, int]) -> None:
+        self.applying = False
+        self.set_apply_controls(True)
+        self.query_one("#apply-log", RichLog).scroll_visible()
+        if failure is not None:
+            self.show_activity(
+                f"● Apply failed: {failure}. Run 'sudo -v' in the terminal, then retry.", "error"
+            )
+            self.notify(f"Apply failed: {failure}", severity="error", timeout=10)
+        else:
+            # The plan's own values become the readings: not a row's current
+            # text, which may have changed while the commands ran, and not a
+            # row the selected modes never wrote.
+            for setting in self.settings:
+                if setting.key in applied:
+                    setting.live = applied[setting.key]
+            for row in self.query(ValueRow):
+                row.refresh_value()
+            write_last_values(self.settings, applied=True, options=self.options)
+            self.last_change = self.last_apply = datetime.now()
+            self.refresh_activity()
+            self.notify("Applied to hardware", timeout=5)
+        self.refresh_telemetry()
+        self.refresh_status_rail()
+
+    def apply_commands(self) -> ApplyPlan:
+        """Build the commands the selected modes call for, from ungated previews."""
+        plan = ApplyPlan()
         # A control can be missing (its documentation row failed to parse) as
-        # well as unavailable; .get keeps both on the ValueError path.
-        values = {s.key: s.value for s in self.settings}
-        commands = []
-        if self.options['intel-mode'] == 'apply':
-            selected = {key: values.get(key) for key in intel_controls.SPECS}
-            intel_controls.updated_config(intel_controls.CONFIG.read_text(), selected)
-            commands.append((['sudo', '-n', sys.executable, str(Path(__file__).with_name('intel_controls.py'))], json.dumps(selected)))
-        elif self.options['intel-mode'] == 'undervolt':
-            selected = {key: values.get(key) for key in intel_controls.SPECS}
-            commands.append((intel_controls.python_undervolt_command(selected), None))
+        # well as unavailable or gated; .get keeps all three on the ValueError path.
+        previews = {s.key: s.value for s in self.settings if self.gate(s.key) is None}
+
+        def planned(key: str) -> int | None:
+            """Read a preview into the plan, so Apply knows what it wrote."""
+            value = previews.get(key)
+            if value is not None:
+                plan.values[key] = value
+            return value
+
+        commands = plan.commands
+        intel_mode = self.options['intel-mode']
+        if intel_mode in ('apply', 'undervolt'):
+            selected = {key: planned(key) for key in intel_controls.SPECS}
+            if intel_mode == 'apply':
+                intel_controls.updated_config(intel_controls.CONFIG.read_text(), selected)
+                commands.append((['sudo', '-n', sys.executable, str(Path(__file__).with_name('intel_controls.py'))], json.dumps(selected)))
+            else:
+                commands.append((intel_controls.python_undervolt_command(selected), None))
+
         def write(path, value):
             commands.append((["sudo", "-n", "tee", str(path)], f"{value}\n"))
+
         profile = self.options['profile']
         if profile not in self.profiles:
             raise ValueError('Lenovo profile unavailable')
-        write('/sys/firmware/acpi/platform_profile', profile)
+        write(PLATFORM_PROFILE, profile)
         if profile == 'custom':
-            for key, attribute in [('lenovo-cpu-cross-load-limit', 'ppt_cpu_cl'), ('lenovo-cpu-sustained-limit', 'ppt_pl1_spl'), ('lenovo-cpu-burst-limit', 'ppt_pl2_sppt'), ('lenovo-cpu-temperature-target', 'cpu_temp'), ('lenovo-gpu-temperature-target', 'gpu_temp')]:
-                value = values.get(key)
+            for key, attribute in LENOVO_ATTRIBUTES.items():
+                value = planned(key)
                 if value is None:
                     raise ValueError(f'{key} unavailable')
-                write(f'/sys/class/firmware-attributes/lenovo-wmi-other-0/attributes/{attribute}/current_value', value)
+                write(LENOVO_ATTRIBUTE_ROOT / attribute / 'current_value', value)
         if turbo_state() is None:
             raise ValueError('Turbo state unavailable')
         turbo = self.options['turbo'] == 'on'
-        write('/sys/devices/system/cpu/intel_pstate/no_turbo', 0 if turbo else 1)
-        for group, policies in cpu_groups().items():
-            low = values.get(f'cpu-{group}-core-minimum-frequency')
-            high = values.get(f'cpu-{group}-core-maximum-frequency')
+        write(NO_TURBO, 0 if turbo else 1)
+        for group, policies in self.cpu_groups.items():
+            name = cpu_group_name(group)
+            low = planned(f'cpu-{group}-core-minimum-frequency')
+            high = planned(f'cpu-{group}-core-maximum-frequency')
             if not policies or low is None or high is None or low > high:
-                raise ValueError(f'{group.upper()}-core frequency range unavailable or invalid')
-            maximum = (5400 if group == 'p' else 3900) if turbo else (2200 if group == 'p' else 1600)
-            if low < 800 or high > maximum:
-                raise ValueError(f'{group.upper()}-core ceiling must be ≤ {maximum} MHz with Turbo {self.options["turbo"]}')
+                raise ValueError(f'{name}-core frequency range unavailable or invalid')
+            try:
+                floor, base, ceiling = cpu_group_limits(policies)
+            except (OSError, ValueError) as error:
+                raise ValueError(f'{name}-core driver limits unavailable: {error}') from error
+            # With Turbo off the kernel caps at base, so a higher ceiling is a lie.
+            maximum = ceiling if turbo or base is None else base
+            if low < floor or high > maximum:
+                raise ValueError(
+                    f'{name}-core range must stay within {floor}–{maximum} MHz with Turbo {self.options["turbo"]}'
+                )
             for policy in policies:
                 # Lower the floor first so lowering a ceiling never crosses it.
-                write(policy / 'scaling_min_freq', 800000)
+                write(policy / 'scaling_min_freq', floor * 1000)
                 write(policy / 'scaling_max_freq', high * 1000)
                 write(policy / 'scaling_min_freq', low * 1000)
         if self.nvidia_power_limit_available:
-            power_limit = values.get('nvidia-power-ceiling')
+            power_limit = planned('nvidia-power-ceiling')
             if power_limit is None:
                 raise ValueError('NVIDIA power limit unavailable')
-            commands.append((["sudo", "-n", "nvidia-smi", "-i", "0", "-pl", str(power_limit)], None))
+            commands.append((["sudo", "-n", "nvidia-smi", "-i", NVIDIA_GPU_INDEX, "-pl", str(power_limit)], None))
         for domain, lock, reset in [('core', '-lgc', '-rgc'), ('memory', '-lmc', '-rmc')]:
             mode = self.options[f'{domain}-mode']
             if mode == 'keep':
                 continue
-            arguments = ["sudo", "-n", "nvidia-smi", "-i", "0"]
+            arguments = ["sudo", "-n", "nvidia-smi", "-i", NVIDIA_GPU_INDEX]
             if mode == 'auto':
                 arguments.append(reset)
             elif mode == 'locked':
-                low, high = (values.get(f'nvidia-{domain}-clock-{bound}') for bound in ('minimum', 'maximum'))
+                low, high = (planned(f'nvidia-{domain}-clock-{bound}') for bound in ('minimum', 'maximum'))
                 if low is None or high is None or low > high:
                     raise ValueError(f'GPU {domain} clock range invalid or unavailable')
                 arguments.extend([lock, f'{low},{high}'])
             else:
                 raise ValueError('Unknown GPU clock mode')
             commands.append((arguments, None))
-        return commands
-
+        return plan
 
 
 if __name__ == "__main__":
