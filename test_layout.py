@@ -710,7 +710,8 @@ class LayoutTest(unittest.IsolatedAsyncioTestCase):
                 dialog = "\n".join(str(static.render()) for static in app.screen.query(Static))
                 self.assertIn("sudo -n nvidia-smi -i 0 -pl 150", dialog)
                 self.assertIn("Apply 1 command(s)", dialog)
-                self.assertIs(app.screen.focused, app.screen.query_one("#cancel", Button))
+                self.assertIs(app.screen.focused, app.screen.query_one("#confirm-commands"))
+                self.assertIn("Apply now? [Y/n]", str(app.screen.query_one("#confirm-question", Static).render()))
 
                 # A second Apply while the dialog is open must not stack another.
                 dialog_screen = app.screen
@@ -731,6 +732,28 @@ class LayoutTest(unittest.IsolatedAsyncioTestCase):
 
         run_command.assert_called_once()
         self.assertIn("APPLIED", output)
+
+    async def test_confirmation_uses_y_for_apply_and_other_keys_for_cancel(self):
+        command = ["sudo", "-n", "nvidia-smi", "-i", "0", "-pl", "150"]
+        with ExitStack() as stack:
+            app = headless_app(stack)
+            stack.enter_context(patch.object(TunnerApp, "apply_commands", return_value=ApplyPlan([(command, None)])))
+            run_command = stack.enter_context(patch("app.run_command"))
+            async with app.run_test() as pilot:
+                await settle(app, pilot)
+                app.action_apply()
+                await settle(app, pilot)
+                await pilot.press("x")
+                await pilot.pause()
+                self.assertNotIsInstance(app.screen, ApplyConfirmation)
+                run_command.assert_not_called()
+
+                app.action_apply()
+                await settle(app, pilot)
+                await pilot.press("y")
+                await settle(app, pilot)
+
+        run_command.assert_called_once()
 
     async def test_planning_failure_is_reported_without_a_dialog(self):
         with ExitStack() as stack:

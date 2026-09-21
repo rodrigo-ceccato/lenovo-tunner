@@ -149,8 +149,9 @@ features** fold describes what each switch does.
 **Apply** first builds the plan; a plan the app rejects (a PL1 above PL2, a
 ceiling above the Turbo cap, an unavailable value, both battery modes enabled)
 is reported in the log and never reaches a dialog. Otherwise a confirmation
-dialog lists every command exactly as it will run, warns if `sudo` has no
-cached credentials, and requires **Apply now** (`Escape` cancels).
+dialog keeps an **Apply now? [Y/n]** prompt at the top while its command list
+scrolls freely, warns if `sudo` has no cached credentials, and requires `Y`
+to apply; every other non-navigation key cancels.
 Authenticate first in the terminal with `sudo -v`; the app intentionally uses
 non-interactive `sudo` and does not capture passwords, and the notice under
 the title says so when the check fails at startup. The confirmed commands run

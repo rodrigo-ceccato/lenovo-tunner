@@ -25,7 +25,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.command import DiscoveryHit, Hit, Hits, Provider
 from textual.containers import Container, Horizontal, VerticalScroll
-from textual.events import MouseScrollDown, MouseScrollUp, Resize
+from textual.events import Key, MouseScrollDown, MouseScrollUp, Resize
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.timer import Timer
@@ -1341,7 +1341,13 @@ class TuningPlan(VerticalScroll):
 class ApplyConfirmation(ModalScreen[ApplyPlan | None]):
     """Show exactly what will run, and require a second action to run it."""
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    # Keep navigation keys available to the command preview.  Every other
+    # keyboard answer is deliberately a yes/no answer: Y applies, anything
+    # else backs out without changing hardware.
+    SCROLL_KEYS = frozenset({
+        "up", "down", "left", "right", "pageup", "pagedown", "home", "end",
+        "ctrl+home", "ctrl+end", "tab", "shift+tab",
+    })
 
     def __init__(self, plan: ApplyPlan, sudo_ok: bool = True) -> None:
         super().__init__()
@@ -1353,6 +1359,10 @@ class ApplyConfirmation(ModalScreen[ApplyPlan | None]):
             yield Static(
                 f"Apply {len(self.plan.commands)} command(s) to live hardware?", id="confirm-text"
             )
+            with Horizontal(id="confirm-prompt"):
+                yield Static("Apply now? [Y/n]", id="confirm-question")
+                yield Button("Apply now [Y]", id="confirm", variant="error")
+                yield Button("Cancel", id="cancel")
             if not self.sudo_ok:
                 yield Static(
                     "sudo is not authenticated: these commands will fail until you run "
@@ -1365,12 +1375,10 @@ class ApplyConfirmation(ModalScreen[ApplyPlan | None]):
                     or "No commands planned.",
                     markup=False,
                 )
-            with Horizontal(classes="confirm-actions"):
-                yield Button("Cancel", id="cancel")
-                yield Button("Apply now", id="confirm", variant="error")
 
     def on_mount(self) -> None:
-        self.query_one("#cancel", Button).focus()
+        # Let ↑/↓, Page Up/Down, Home and End scroll the preview immediately.
+        self.query_one("#confirm-commands", VerticalScroll).focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         event.stop()
@@ -1378,6 +1386,19 @@ class ApplyConfirmation(ModalScreen[ApplyPlan | None]):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+    def action_confirm(self) -> None:
+        self.dismiss(self.plan)
+
+    def on_key(self, event: Key) -> None:
+        """Treat the prompt as Y/n without trapping command-preview scrolling."""
+        if event.key in self.SCROLL_KEYS:
+            return
+        if event.key.lower() == "y":
+            self.action_confirm()
+        else:
+            self.action_cancel()
+        event.stop()
 
 
 class TunnerCommands(Provider):
@@ -1461,12 +1482,13 @@ class TunnerApp(App[None]):
     .readout { color: $foreground-muted; }
     .panel-note { color: $text-muted; margin-top: 1; }
     ApplyConfirmation { align: center middle; background: $background 60%; }
-    #confirm-dialog { width: 90%; max-width: 100; height: auto; max-height: 90%; padding: 1 2; background: $panel; border: solid $border; }
+    #confirm-dialog { width: 90%; max-width: 100; height: 90%; padding: 1 2; background: $panel; border: solid $border; }
     #confirm-text { margin-bottom: 1; text-style: bold; }
+    #confirm-prompt { height: auto; margin-bottom: 1; }
+    #confirm-question { width: 1fr; text-style: bold; }
+    #confirm-prompt Button { margin-left: 1; }
     #confirm-warning { color: $warning; margin-bottom: 1; }
-    #confirm-commands { height: auto; max-height: 20; border: solid $border-blurred; padding: 0 1; margin-bottom: 1; }
-    .confirm-actions { height: auto; }
-    .confirm-actions Button { margin-right: 1; }
+    #confirm-commands { height: 1fr; border: solid $border-blurred; padding: 0 1; }
     """
     BINDINGS = [
         Binding("a", "apply", "Apply"),
