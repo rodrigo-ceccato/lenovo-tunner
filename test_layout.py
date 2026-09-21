@@ -1240,6 +1240,28 @@ class LayoutTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("●", str(row.query_one(".setting-name", Label).render()))
                 self.assertIn("Applied successfully", activity_text(app))
 
+    async def test_turbo_apply_refreshes_cpu_frequency_bounds(self):
+        # intel_pstate exposes base clocks as cpuinfo_max_freq while Turbo is
+        # off. Once its no_turbo write succeeds, the already-mounted rows
+        # must use the newly exposed boost limit without an app restart.
+        floor = TuningValue("CPU P-core minimum frequency", 800, 800, 2200, "MHz", 100)
+        ceiling = TuningValue("CPU P-core maximum frequency", 2200, 800, 2200, "MHz", 100)
+        with ExitStack() as stack:
+            app = headless_app(stack, cpu=[floor, ceiling])
+            stack.enter_context(patch("app.cpu_groups", return_value={"p": [Path("/policy0")]}))
+            stack.enter_context(patch("app.cpu_group_limits", return_value=(800, 2200, 5400)))
+            stack.enter_context(patch("app.cpu_boost_text", return_value="Rated boost (not a live limit)\nP: up to 5400 MHz"))
+            async with app.run_test() as pilot:
+                await settle(app, pilot)
+                app.finish_apply(None, ApplyPlan(
+                    commands=[(["sudo", "-n", "tee", str(app_module.NO_TURBO)], "0\n")],
+                ))
+                await pilot.pause()
+
+                self.assertEqual((floor.maximum, ceiling.maximum), (5400, 5400))
+                row = next(row for row in app.query(ValueRow) if row.setting is ceiling)
+                self.assertIn("800–5400 MHz", str(row.query_one("#range", Static).render()))
+
     async def test_startup_selects_do_not_refresh_every_row_again(self):
         # Every Select posts Changed for its initial value at mount; those
         # are not edits, so the rows and rail are refreshed once, by the probe.
@@ -1770,6 +1792,22 @@ class LayoutTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_controls_remain_visible_after_resize_with_confirmation(self):
         await self.check_resize_layout(confirmation_open=True)
+
+    async def test_apply_controls_stay_visible_in_a_short_terminal(self):
+        # The command log follows the actions, so scrolling to the bottom
+        # would otherwise carry Apply above the viewport on a short terminal.
+        with ExitStack() as stack:
+            app = headless_app(stack, settings=[clock_row(3000)])
+            async with app.run_test(size=(100, 10)) as pilot:
+                await settle(app, pilot)
+                plan = app.query_one("#tuning-plan")
+                apply = app.query_one("#apply", Button)
+                plan.scroll_end(animate=False, immediate=True)
+                await pilot.pause()
+
+                viewport = plan.scrollable_content_region
+                self.assertGreaterEqual(apply.region.y, viewport.y)
+                self.assertLessEqual(apply.region.y + apply.region.height, viewport.y + viewport.height)
 
     async def check_resize_layout(self, *, confirmation_open):
         setting = clock_row(3000)

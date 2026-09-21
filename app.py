@@ -1441,7 +1441,8 @@ class TunnerApp(App[None]):
     .value { width: 13; }
     .step { min-width: 5; width: 5; }
     .toggle-row .choice { width: 22; margin-left: 1; }
-    #workloads, #actions { height: auto; margin-top: 1; }
+    #workloads { height: auto; margin-top: 1; }
+    #actions { dock: bottom; height: auto; margin-top: 1; padding: 1 0 0 0; background: $background; }
     #workloads Button, #actions Button { margin-right: 1; }
     #apply-log-title { color: $primary; text-style: bold; margin-top: 1; }
     #apply-log { height: 10; border: solid $border-blurred; padding: 0 1; background: $surface; }
@@ -1821,6 +1822,35 @@ class TunnerApp(App[None]):
             row.setting.note = notes.get(key)
             row.refresh_value()
 
+    def refresh_cpu_clock_ranges(self) -> None:
+        """Refresh CPU row bounds after a successful Turbo-state write.
+
+        intel_pstate lowers ``cpuinfo_max_freq`` to the base clock while
+        Turbo is disabled.  The original probe therefore cannot know the
+        boost range until Turbo has been enabled.  Keep the user's preview,
+        but replace the bounds and validators as soon as the driver reports
+        the new range.
+        """
+        settings = {setting.key: setting for setting in self.settings}
+        for group, policies in self.cpu_groups.items():
+            try:
+                floor, _, ceiling = cpu_group_limits(policies)
+            except (OSError, ValueError):
+                continue
+            for bound in ("minimum", "maximum"):
+                setting = settings.get(f"cpu-{group}-core-{bound}-frequency")
+                if setting is None:
+                    continue
+                setting.minimum, setting.maximum = floor, ceiling
+                if setting.value is not None:
+                    setting.value = max(floor, min(ceiling, setting.value))
+                if setting.live is not None:
+                    setting.live = max(floor, min(ceiling, setting.live))
+        self.cpu_boost = cpu_boost_text(self.cpu_groups)
+        for row in self.query(ValueRow):
+            if row.setting.key.startswith("cpu-"):
+                row.refresh_value()
+
     def show_activity(self, text: str, tone: str = "ok") -> None:
         """Show a one-off message and keep it until something newer happens."""
         self.activity_message = (datetime.now(), text, tone)
@@ -2146,6 +2176,11 @@ class TunnerApp(App[None]):
         for setting in self.settings:
             if setting.key in applied:
                 setting.live = applied[setting.key]
+        # Enabling Turbo makes intel_pstate publish the rated boost ceiling
+        # only after its no_turbo write succeeds.  Re-read it now so the CPU
+        # fields expand immediately instead of requiring an app restart.
+        if failure is None and any(arguments[-1] == str(NO_TURBO) for arguments, _ in plan.commands):
+            self.refresh_cpu_clock_ranges()
         # Only the marker and range text change here; the field itself is
         # left alone, since this lands whenever the commands happen to
         # finish and would otherwise wipe a value being typed.
