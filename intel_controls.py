@@ -66,9 +66,20 @@ def python_undervolt_command(values, executable=sys.executable):
         '--temp', str(100 + values['intel-thermal-offset']),
     ]
 
+def _load_saved_values():
+    """Load previously applied values from last-values.json without importing the UI layer."""
+    try:
+        payload = json.loads(Path(__file__).with_name('last-values.json').read_text(encoding='utf-8'))
+        values = payload.get('values', {})
+        return {key: value for key, value in values.items() if type(value) is int}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
 def live_control_values():
     """Return editable live-mode values without requiring a persistent config."""
     values = LIVE_DEFAULTS.copy()
+    saved = _load_saved_values()
     root = Path('/sys/class/powercap/intel-rapl:0')
     paths = {
         'intel-pl1-sustained-power': (root / 'constraint_0_power_limit_uw', 1_000_000),
@@ -80,14 +91,40 @@ def live_control_values():
         try:
             value = round(int(path.read_text()) / divisor)
         except (OSError, ValueError):
-            continue
+            value = None
         low, high, _, _ = SPECS[key]
-        if low <= value <= high:
+        if value is not None and low <= value <= high:
             values[key] = value
+            continue
+        # RAPL unreadable or out of range: fall back to the saved preview
+        # (same treatment the thermal offset already gets below), then default.
+        fallback = saved.get(key)
+        if fallback is not None and low <= fallback <= high:
+            values[key] = fallback
     if values['intel-pl1-sustained-power'] > values['intel-pl2-burst-power']:
-        values.update({key: LIVE_DEFAULTS[key] for key in (
-            'intel-pl1-sustained-power', 'intel-pl2-burst-power'
-        )})
+        rescued = {
+            key: saved.get(key) for key in (
+                'intel-pl1-sustained-power', 'intel-pl2-burst-power'
+            )
+        }
+        if (
+            all(type(v) is int for v in rescued.values())
+            and SPECS['intel-pl1-sustained-power'][0] <= rescued['intel-pl1-sustained-power'] <= SPECS['intel-pl1-sustained-power'][1]
+            and SPECS['intel-pl2-burst-power'][0] <= rescued['intel-pl2-burst-power'] <= SPECS['intel-pl2-burst-power'][1]
+            and rescued['intel-pl1-sustained-power'] <= rescued['intel-pl2-burst-power']
+        ):
+            values.update(rescued)
+        else:
+            values.update({key: LIVE_DEFAULTS[key] for key in (
+                'intel-pl1-sustained-power', 'intel-pl2-burst-power'
+            )})
+    # _load_saved_values already keeps only `type(value) is int`, so only the
+    # range needs checking here.
+    if 'intel-thermal-offset' in saved:
+        offset = saved['intel-thermal-offset']
+        low, high, _, _ = SPECS['intel-thermal-offset']
+        if low <= offset <= high:
+            values['intel-thermal-offset'] = offset
     return values
 
 def live_limits():

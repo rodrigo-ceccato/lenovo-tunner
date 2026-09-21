@@ -1,5 +1,7 @@
 # Tunner
 
+Vibe-coded lenovo legion tunner
+
 A minimal TUI for the adjustable ranges documented in
 `lenovo-tuning.md`. At startup it reads the active Lenovo firmware values and
 CPU frequency policies, and uses read-only NVIDIA queries to discover the

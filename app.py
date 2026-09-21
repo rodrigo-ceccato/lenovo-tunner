@@ -456,7 +456,7 @@ def load_last_values() -> dict[str, int]:
     try:
         payload = json.loads(LAST_VALUES.read_text(encoding="utf-8"))
         values = payload.get("values", {})
-        return {key: value for key, value in values.items() if isinstance(value, int)}
+        return {key: value for key, value in values.items() if type(value) is int}
     except (OSError, ValueError, AttributeError):
         return {}
 
@@ -583,8 +583,10 @@ class StatusRail(VerticalScroll):
 
         cpu_temp = telemetry.cpu_temperature
         gpu_temp = telemetry.gpu_temperature
+        intel_offset = values.get('intel-thermal-offset')
+        intel_target = f"{100 + intel_offset}°C (offset {intel_offset})" if type(intel_offset) is int else "unverified"
         self.query_one("#cpu-thermal", Static).update(
-            f"CPU THERMAL  {cpu_temp:.0f}°C\nIntel thermal limit: unverified"
+            f"CPU THERMAL  {cpu_temp:.0f}°C\nIntel thermal target (preview): {intel_target}"
             if cpu_temp is not None
             else "CPU THERMAL\nNo sensor reading"
         )
@@ -627,7 +629,9 @@ class StatusRail(VerticalScroll):
             f"VRAM lock  {value('nvidia-memory-clock-minimum')}–{value('nvidia-memory-clock-maximum')} MHz\n"
             f"GPU  {value('nvidia-power-ceiling')} W ceiling\n"
             f"Lenovo PL1/PL2: {value('lenovo-cpu-sustained-limit')}/{value('lenovo-cpu-burst-limit')} W\n"
-            f"CPU/GPU targets: {value('lenovo-cpu-temperature-target')}/{value('lenovo-gpu-temperature-target')}°C\n"
+            f"Intel PL1/PL2: {value('intel-pl1-sustained-power')}/{value('intel-pl2-burst-power')} W\n"
+            f"Intel thermal target: {intel_target} (preview, python undervolt --temp)\n"
+            f"Lenovo CPU/GPU targets: {value('lenovo-cpu-temperature-target')}/{value('lenovo-gpu-temperature-target')}°C\n"
             "Firmware targets require Custom"
         )
 
@@ -749,6 +753,7 @@ class TunnerApp(App[None]):
 
     def on_mount(self) -> None:
         self.update_layout(self.size.width)
+        self.update_row_disabled_state()
         self.refresh_telemetry()
         self.refresh_activity()
         self.set_interval(2, self.refresh_telemetry)
@@ -841,6 +846,20 @@ class TunnerApp(App[None]):
         except ProcessLookupError:
             pass
 
+    def update_row_disabled_state(self) -> None:
+        for row in self.query(ValueRow):
+            if row.setting.key.startswith('intel-'):
+                row.disabled = self.options['intel-mode'] == 'keep'
+            elif row.setting.key.startswith("lenovo-"):
+                row.disabled = self.options['profile'] != 'custom'
+            elif row.setting.key.startswith("nvidia-core-clock"):
+                row.disabled = self.options['core-mode'] != 'locked'
+            elif row.setting.key.startswith("nvidia-memory-clock"):
+                row.disabled = (
+                    self.options['memory-mode'] != 'locked'
+                    or (row.setting.value is None and row.setting.unavailable_reason is not None)
+                )
+
     def on_select_changed(self, event: Select.Changed) -> None:
         key = event.select.id
         if key in self.options and isinstance(event.value, str) and self.options[key] != event.value:
@@ -854,18 +873,7 @@ class TunnerApp(App[None]):
                         row.refresh_value()
             write_last_values(self.settings, options=self.options)
             self.last_change = datetime.now()
-        for row in self.query(ValueRow):
-            if row.setting.key.startswith('intel-'):
-                row.disabled = self.options['intel-mode'] == 'keep'
-            elif row.setting.key.startswith("lenovo-"):
-                row.disabled = self.options['profile'] != 'custom'
-            elif row.setting.key.startswith("nvidia-core-clock"):
-                row.disabled = self.options['core-mode'] != 'locked'
-            elif row.setting.key.startswith("nvidia-memory-clock"):
-                row.disabled = (
-                    self.options['memory-mode'] != 'locked'
-                    or row.setting.value is None and row.setting.unavailable_reason is not None
-                )
+        self.update_row_disabled_state()
 
     def refresh_telemetry(self) -> None:
         self.query_one(StatusRail).refresh_status(self.settings, read_telemetry())
@@ -901,7 +909,7 @@ class TunnerApp(App[None]):
     def restore_saved(self) -> None:
         saved = load_last_values()
         try:
-            options = json.loads(LAST_VALUES.read_text()).get('options', {})
+            options = json.loads(LAST_VALUES.read_text(encoding="utf-8")).get('options', {})
             for key, allowed in {'intel-mode': ['keep', 'apply', 'undervolt'], 'profile': self.profiles, 'turbo': ['on', 'off'], 'core-mode': ['keep', 'auto', 'locked'], 'memory-mode': ['keep', 'auto', 'locked']}.items():
                 if options.get(key) in allowed:
                     self.query_one(f'#{key}', Select).value = options[key]
@@ -929,6 +937,7 @@ class TunnerApp(App[None]):
             )
             row.refresh_value()
             restored += 1
+        self.update_row_disabled_state()
         self.last_change = datetime.now()
         activity = self.query_one("#activity", Static)
         activity.styles.color = "#6ee7a8"
