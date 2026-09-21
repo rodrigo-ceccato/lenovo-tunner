@@ -2278,6 +2278,7 @@ class TunnerApp(App[None]):
         # A control can be missing (its documentation row failed to parse) as
         # well as unavailable or gated; .get keeps all three on the ValueError path.
         previews = {s.key: s.value for s in self.settings if self.gate(s.key) is None}
+        settings_by_key = {setting.key: setting for setting in self.settings}
 
         def planned(key: str) -> int | None:
             """Read a preview into the plan, so Apply knows what it wrote."""
@@ -2316,13 +2317,31 @@ class TunnerApp(App[None]):
                 write(LENOVO_ATTRIBUTE_ROOT / attribute / 'current_value', value, (key,))
         # Without intel_pstate there is no Turbo switch to write and nothing
         # caps a ceiling at base, so the driver's rated maximum is the limit.
-        turbo = None if turbo_state() is None else self.options['turbo'] == 'on'
-        if turbo is not None:
+        current_turbo = turbo_state()
+        turbo = None if current_turbo is None else self.options['turbo'] == 'on'
+        # Do not touch CPU policy state as a side effect of applying an
+        # unrelated setting.  A changed Turbo choice is still an explicit
+        # request, and needs its sysfs write before any changed ranges.
+        if turbo is not None and turbo != current_turbo:
             write(NO_TURBO, 0 if turbo else 1)
         for group, policies in self.cpu_groups.items():
             name = cpu_group_name(group)
-            low = planned(f'cpu-{group}-core-minimum-frequency')
-            high = planned(f'cpu-{group}-core-maximum-frequency')
+            low_key = f'cpu-{group}-core-minimum-frequency'
+            high_key = f'cpu-{group}-core-maximum-frequency'
+            low_setting = settings_by_key.get(low_key)
+            high_setting = settings_by_key.get(high_key)
+            # CPU ranges have no separate Apply mode.  They are therefore
+            # written only when their preview differs from the live reading;
+            # this prevents a GPU-only Apply from needlessly resetting CPU
+            # policies.  An unknown reading remains safe to write.
+            if (
+                low_setting is not None and high_setting is not None
+                and low_setting.live is not None and high_setting.live is not None
+                and not low_setting.modified and not high_setting.modified
+            ):
+                continue
+            low = planned(low_key)
+            high = planned(high_key)
             if not policies or low is None or high is None or low > high:
                 raise ValueError(f'{name}-core frequency range unavailable or invalid')
             try:
@@ -2335,7 +2354,7 @@ class TunnerApp(App[None]):
                 raise ValueError(
                     f'{name}-core range must stay within {floor}–{maximum} MHz with Turbo {self.options["turbo"]}'
                 )
-            range_keys = (f'cpu-{group}-core-minimum-frequency', f'cpu-{group}-core-maximum-frequency')
+            range_keys = (low_key, high_key)
             for index, policy in enumerate(policies):
                 # Lower the floor first so lowering a ceiling never crosses it.
                 write(policy / 'scaling_min_freq', floor * 1000)

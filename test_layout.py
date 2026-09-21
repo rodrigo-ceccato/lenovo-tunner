@@ -488,6 +488,22 @@ class ApplyCommandTest(unittest.TestCase):
             app.apply_commands()
 
     @patch("app.cpu_group_limits", return_value=(800, 2200, 5400))
+    @patch("app.turbo_state", return_value=True)
+    def test_gpu_only_apply_does_not_rewrite_unchanged_cpu_policy(self, _turbo, _limits):
+        settings = [
+            TuningValue("CPU P-core minimum frequency", 800, 800, 5400, "MHz", 100, live=800),
+            TuningValue("CPU P-core maximum frequency", 4000, 800, 5400, "MHz", 100, live=4000),
+            TuningValue("NVIDIA power ceiling", 150, 5, 175, "W", live=120),
+        ]
+        app = self.app(settings, groups={"p": [Path("/policy0")]}, power_available=True)
+
+        plan = app.apply_commands()
+
+        self.assertFalse(any("/policy0" in arguments[-1] for arguments, _ in plan.commands))
+        self.assertFalse(any(arguments[-1] == str(app_module.NO_TURBO) for arguments, _ in plan.commands))
+        self.assertEqual(plan.values, {"nvidia-power-ceiling": 150})
+
+    @patch("app.cpu_group_limits", return_value=(800, 2200, 5400))
     @patch("app.turbo_state", return_value=None)
     def test_without_intel_pstate_the_turbo_write_is_skipped_not_fatal(self, _turbo, _limits):
         settings = [
