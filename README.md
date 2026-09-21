@@ -60,6 +60,11 @@ Python package to write PL1, PL2, their windows, and the thermal target directly
 through Intel MSRs. It does not change voltage offsets or configuration files,
 and its limits are not persistent across reboot. This mode requires the `msr`
 kernel module and the project dependency installed from `requirements.txt`.
+Selecting it fills any Intel row that has no configuration value with the live
+RAPL limit; the thermal offset has no unprivileged readback, so it comes from
+the last saved preview or the −10 default. A live reading the hardware stores
+as "unlimited" is clamped to the 4095 W bound and the raw reading is shown in
+place of the range.
 
 **Apply** opens a confirmation dialog, then runs the documented CPU, Lenovo,
 and NVIDIA commands. Authenticate first in the terminal with `sudo -v`; the
@@ -70,9 +75,12 @@ telemetry cannot be read, its controls remain visible but disabled; this does
 not imply that the GPU itself is absent.
 
 The **Apply command log** shows the commands attempted by the latest Apply and
-whether each one succeeded. Every external command Tunner launches, including
-read-only telemetry and probes, is also appended to `log.txt` with a timestamp
-and a `READ`, `WRITE`, or `EXEC` label.
+whether each one succeeded. A failed command's error output (for example
+`sudo: a password is required`) is shown under it, and what a command reported
+on success, such as the confirmed NVIDIA power limit or the Intel helper's
+backup path, is listed beneath its line. Every external command Tunner
+launches, including read-only telemetry and probes, is also appended to
+`log.txt` with a timestamp and a `READ`, `WRITE`, or `EXEC` label.
 
 The **Stress CPU** and **Stress GPU** buttons start separate workloads only when
 clicked; clicking an active button stops its workload, and closing Tunner stops

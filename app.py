@@ -16,7 +16,7 @@ from command_log import record_command, render_command
 
 from textual.app import App, ComposeResult
 from textual.events import Resize
-from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.containers import Container, Horizontal, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.validation import Number
@@ -51,6 +51,9 @@ class TuningValue:
     step: int = 1
     choices: tuple[int, ...] = ()
     unavailable_reason: str | None = None
+    # Shown in place of the range when the value needs a caveat, such as a
+    # live reading that had to be clamped into the spec.
+    note: str | None = None
 
     def change(self, amount: int) -> None:
         if self.value is None:
@@ -194,7 +197,7 @@ def intel_values():
         values = intel_controls.parse_config(intel_controls.CONFIG.read_text())
     except (OSError, ValueError):
         values = {}
-    return [TuningValue(key.replace('-', ' ').replace('pl1', 'PL1').replace('pl2', 'PL2').capitalize(),
+    return [TuningValue(key.replace('-', ' ').capitalize().replace('pl1', 'PL1').replace('pl2', 'PL2'),
                         values.get(key), low, high, unit, step=step,
                         unavailable_reason='Intel config unavailable or unsupported' if key not in values else None)
             for key, (low, high, unit, step) in intel_controls.SPECS.items()]
@@ -232,6 +235,24 @@ def run_command(
     """Log and run one external command without invoking a shell."""
     record_command(arguments, access, input_text)
     return subprocess.run(arguments, input=input_text, **kwargs)
+
+
+def describe_error(error: BaseException) -> str:
+    """One line for an error; unexpected types are named so 'x' is not all we see."""
+    if isinstance(error, (ValueError, OSError, subprocess.SubprocessError)):
+        return str(error)
+    return f"{type(error).__name__}: {error}"
+
+
+def failure_lines(error: BaseException) -> list[str]:
+    """Describe a failed command: its exception, then whatever it wrote to stderr."""
+    stderr = getattr(error, "stderr", None)
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode(errors="replace")
+    lines = [describe_error(error)]
+    if isinstance(stderr, str):
+        lines.extend(line.strip() for line in stderr.splitlines() if line.strip())
+    return lines
 
 
 def probe_documented_values(settings: list[TuningValue]) -> list[TuningValue]:
@@ -396,9 +417,10 @@ def read_telemetry() -> Telemetry:
                   "gpu_max_memory", "gpu_headroom")
         for field, raw in zip(fields, parts):
             try:
-                setattr(telemetry, field, float(raw))
+                number = float(raw)
             except ValueError:
-                pass  # An unsupported field must not erase other readings.
+                continue  # An unsupported field must not erase other readings.
+            setattr(telemetry, field, round(number) if field == "gpu_utilization" else number)
         try:
             mask = int(parts[9], 16)
             reasons = ((1, "Idle"), (2, "Application clocks"), (4, "Power cap"),
@@ -491,6 +513,8 @@ class ValueRow(Horizontal):
     def __init__(self, setting: TuningValue) -> None:
         super().__init__(classes="value-row")
         self.setting = setting
+        # Bounds follow the setting, which Restore may narrow after compose.
+        self.range_validator = Number(setting.minimum, setting.maximum)
 
     def compose(self) -> ComposeResult:
         yield Label(self.setting.name, classes="setting-name")
@@ -501,9 +525,9 @@ class ValueRow(Horizontal):
                 "" if self.setting.value is None else str(self.setting.value),
                 id="value",
                 classes="value",
-                disabled=self.setting.value is None and self.setting.unavailable_reason is not None,
+                disabled=self.input_disabled,
                 restrict=r"\d*",
-                validators=Number(self.setting.minimum, self.setting.maximum),
+                validators=self.range_validator,
                 validate_on=["changed"],
                 compact=True,
             )
@@ -511,10 +535,15 @@ class ValueRow(Horizontal):
             yield Static("", id="value", classes="value")
         yield Button("+", id="up", classes="step")
 
+    @property
+    def input_disabled(self) -> bool:
+        return self.setting.value is None and self.setting.unavailable_reason is not None
+
     def on_mount(self) -> None:
         self.refresh_value()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
         self.setting.change(-1 if event.button.id == "down" else 1)
         self.refresh_value()
         self.post_message(self.Changed(self))
@@ -531,7 +560,7 @@ class ValueRow(Horizontal):
         self.post_message(self.Changed(self))
 
     def refresh_value(self) -> None:
-        range_text = self.setting.unavailable_reason or (
+        range_text = self.setting.unavailable_reason or self.setting.note or (
             f"{self.setting.minimum}–{self.setting.maximum} {self.setting.unit}"
         )
         value_text = (
@@ -542,9 +571,15 @@ class ValueRow(Horizontal):
         self.query_one("#range", Static).update(range_text)
         value = self.query_one("#value")
         if isinstance(value, Input):
+            self.range_validator.minimum = self.setting.minimum
+            self.range_validator.maximum = self.setting.maximum
+            value.disabled = self.input_disabled
             expected = "" if self.setting.value is None else str(self.setting.value)
             if value.value != expected:
-                value.value = expected
+                # A programmatic sync must not be validated as user input:
+                # that would re-check it against stale bounds and clear it.
+                with value.prevent(Input.Changed):
+                    value.value = expected
         else:
             value.update(value_text)
         self.refresh_buttons()
@@ -647,6 +682,7 @@ class ApplyConfirmation(ModalScreen[bool]):
                 yield Button("Apply now", id="confirm", variant="error")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
         self.dismiss(event.button.id == "confirm")
 
 
@@ -700,6 +736,9 @@ class TunnerApp(App[None]):
         self.stress_processes: dict[str, subprocess.Popen[str]] = {}
         self.last_change: datetime | None = None
         self.last_apply: datetime | None = None
+        # (when, text, colour) of the last one-off message; it stays on screen
+        # until a newer preview change, apply, or message replaces it.
+        self.activity_message: tuple[datetime, str, str] | None = None
         try:
             self.profiles = Path('/sys/firmware/acpi/platform_profile_choices').read_text().split()
             profile = Path('/sys/firmware/acpi/platform_profile').read_text().strip()
@@ -753,6 +792,7 @@ class TunnerApp(App[None]):
 
     def on_mount(self) -> None:
         self.update_layout(self.size.width)
+        self.populate_live_intel_values()
         self.update_row_disabled_state()
         self.refresh_telemetry()
         self.refresh_activity()
@@ -796,7 +836,7 @@ class TunnerApp(App[None]):
             self.stop_stress(process)
             self.stress_processes.pop(target)
             button.label = f"Stress {target.upper()}"
-            self.query_one("#activity", Static).update(f"● {target.upper()} stress stopped")
+            self.show_activity(f"● {target.upper()} stress stopped")
             return
 
         arguments = [sys.executable, str(Path(__file__).with_name("stress.py")), target]
@@ -809,7 +849,7 @@ class TunnerApp(App[None]):
             start_new_session=True,
         )
         button.label = f"Stop {target.upper()} stress"
-        self.query_one("#activity", Static).update(f"● {target.upper()} stress started; click again to stop")
+        self.show_activity(f"● {target.upper()} stress started; click again to stop")
 
     def refresh_stress_processes(self) -> bool:
         """Reap finished workloads and report failures instead of leaving stale UI."""
@@ -821,13 +861,11 @@ class TunnerApp(App[None]):
 
             self.stress_processes.pop(target)
             self.query_one(f"#stress-{target}", Button).label = f"Stress {target.upper()}"
-            stderr = process.stderr.read().strip() if process.stderr is not None else ""
+            stderr = self.drain_stderr(process)
             if returncode != 0:
                 detail = stderr.splitlines()[-1] if stderr else f"exit status {returncode}"
                 message = f"{target.upper()} stress failed: {detail}"
-                activity = self.query_one("#activity", Static)
-                activity.styles.color = "#ff6b6b"
-                activity.update(f"● {message}")
+                self.show_activity(f"● {message}", "#ff6b6b")
                 self.notify(message, severity="error", timeout=10)
                 failure_reported = True
         return failure_reported
@@ -838,13 +876,53 @@ class TunnerApp(App[None]):
             if process.poll() is None:
                 self.stop_stress(process)
 
+    @classmethod
+    def stop_stress(cls, process: subprocess.Popen[str]) -> None:
+        """Stop a launcher and every worker in its process group, then reap it.
+
+        The caller has checked that the launcher is still alive, so its pid is
+        still ours and safe to signal as a group id. SIGKILL is only a fallback
+        for a launcher that ignores SIGTERM; the waits are short so the UI
+        never stalls for long.
+        """
+        for signum in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(process.pid, signum)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=2)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        cls.drain_stderr(process)
+
     @staticmethod
-    def stop_stress(process: subprocess.Popen[str]) -> None:
-        """Stop a launcher and every worker it created in its own process group."""
+    def drain_stderr(process: subprocess.Popen[str]) -> str:
+        """Read what a launcher wrote to stderr without blocking, then close the pipe.
+
+        Workers inherit the pipe, so a blocking read could hang the UI if any
+        of them outlived the launcher.
+        """
+        if process.stderr is None:
+            return ""
+        chunks: list[bytes] = []
         try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
+            descriptor = process.stderr.fileno()
+            os.set_blocking(descriptor, False)
+            while True:
+                try:
+                    chunk = os.read(descriptor, 65536)
+                except BlockingIOError:
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        except (OSError, ValueError):
             pass
+        finally:
+            process.stderr.close()
+        return b"".join(chunks).decode(errors="replace").strip()
 
     def update_row_disabled_state(self) -> None:
         for row in self.query(ValueRow):
@@ -864,42 +942,81 @@ class TunnerApp(App[None]):
         key = event.select.id
         if key in self.options and isinstance(event.value, str) and self.options[key] != event.value:
             self.options[key] = event.value
-            if key == 'intel-mode' and event.value == 'undervolt':
-                live_values = intel_controls.live_control_values()
-                for row in self.query(ValueRow):
-                    if row.setting.key in live_values and row.setting.value is None:
-                        row.setting.value = live_values[row.setting.key]
-                        row.setting.unavailable_reason = None
-                        row.refresh_value()
+            if key == 'intel-mode':
+                self.populate_live_intel_values()
             write_last_values(self.settings, options=self.options)
             self.last_change = datetime.now()
         self.update_row_disabled_state()
 
+    def populate_live_intel_values(self) -> None:
+        """Give Intel rows without a persistent config a live starting value.
+
+        Only the Python-undervolt mode works without /etc/intel-undervolt.conf,
+        so only that mode fills empty rows. Rows that already hold a value
+        (from the config file or from Restore) are left alone. A reading that
+        had to be clamped into the spec is shown with its raw value in place
+        of the range.
+        """
+        if self.options['intel-mode'] != 'undervolt':
+            return
+        values, notes = intel_controls.live_control_state(load_last_values())
+        for row in self.query(ValueRow):
+            key = row.setting.key
+            if key not in values or row.setting.value is not None:
+                continue
+            row.setting.value = values[key]
+            row.setting.unavailable_reason = None
+            row.setting.note = notes.get(key)
+            row.refresh_value()
+
+    def show_activity(self, text: str, color: str = "#6ee7a8") -> None:
+        """Show a one-off message and keep it until something newer happens."""
+        self.activity_message = (datetime.now(), text, color)
+        activity = self.query_one("#activity", Static)
+        activity.styles.color = color
+        activity.update(text)
+
     def refresh_telemetry(self) -> None:
+        if not self.is_running:
+            return  # Shutdown prunes the screen before it stops this timer.
         self.query_one(StatusRail).refresh_status(self.settings, read_telemetry())
 
     def refresh_activity(self) -> None:
-        if self.refresh_stress_processes():
-            return
+        """Render the newest of: a one-off message, the last apply, the last change.
+
+        On an exact timestamp tie a message beats an apply, which beats a
+        change, matching the order in which the code records them.
+        """
+        if not self.is_running:
+            return  # Shutdown prunes the screen before it stops this timer.
+        self.refresh_stress_processes()
         activity = self.query_one("#activity", Static)
-        if self.last_apply is not None and (
-            self.last_change is None or self.last_apply >= self.last_change
-        ):
-            age = datetime.now() - self.last_apply
-            activity.styles.color = "#6ee7a8"
-            if age < timedelta(seconds=5):
-                activity.update("● Applied successfully just now — saved to last-values.json")
-            else:
-                activity.update(
-                    f"● Applied successfully {int(age.total_seconds())}s ago"
-                )
-            return
-        if self.last_change is None:
+        events: list[tuple[datetime, int, str]] = []
+        if self.activity_message is not None:
+            events.append((self.activity_message[0], 2, "message"))
+        if self.last_apply is not None:
+            events.append((self.last_apply, 1, "apply"))
+        if self.last_change is not None:
+            events.append((self.last_change, 0, "change"))
+        if not events:
             activity.styles.color = "#8e949f"
             activity.update("○ No preview change in this session")
             return
-        age = datetime.now() - self.last_change
-        if age < timedelta(seconds=5):
+        when, _, kind = max(events)
+        age = datetime.now() - when
+        recent = age < timedelta(seconds=5)
+        if kind == "message":
+            _, text, color = self.activity_message
+            activity.styles.color = color
+            activity.update(text)
+        elif kind == "apply":
+            activity.styles.color = "#6ee7a8"
+            activity.update(
+                "● Applied successfully just now — saved to last-values.json"
+                if recent
+                else f"● Applied successfully {int(age.total_seconds())}s ago"
+            )
+        elif recent:
             activity.styles.color = "#6ee7a8"
             activity.update("● Changed just now — saved to last-values.json")
         else:
@@ -916,6 +1033,8 @@ class TunnerApp(App[None]):
                     self.options[key] = options[key]
         except (OSError, ValueError, AttributeError):
             pass
+        # Modes first, so live Intel values back a restored undervolt mode.
+        self.populate_live_intel_values()
         restored = 0
         for setting in self.settings:
             value = saved.get(setting.key)
@@ -923,13 +1042,19 @@ class TunnerApp(App[None]):
                 continue
             if setting.value is None:
                 if setting.key.startswith('intel-'):
-                    continue
-                # The stored value remains usable for an Apply operation even
-                # when live NVIDIA telemetry is temporarily inaccessible.
-                setting.value = value
-                setting.minimum = value
-                setting.maximum = value
-                setting.unavailable_reason = "saved value; live clock query failed"
+                    # The spec bounds are known even without a config file,
+                    # so a saved value inside them is a valid preview.
+                    if not intel_controls.in_spec(setting.key, value):
+                        continue
+                    setting.value = value
+                    setting.unavailable_reason = None
+                else:
+                    # The stored value remains usable for an Apply operation even
+                    # when live NVIDIA telemetry is temporarily inaccessible.
+                    setting.value = value
+                    setting.minimum = value
+                    setting.maximum = value
+                    setting.unavailable_reason = "saved value; live clock query failed"
             else:
                 setting.value = max(setting.minimum, min(setting.maximum, value))
             row = next(
@@ -939,9 +1064,7 @@ class TunnerApp(App[None]):
             restored += 1
         self.update_row_disabled_state()
         self.last_change = datetime.now()
-        activity = self.query_one("#activity", Static)
-        activity.styles.color = "#6ee7a8"
-        activity.update(
+        self.show_activity(
             f"● Restored {restored} saved preview value(s); press Apply to set hardware"
         )
         self.refresh_telemetry()
@@ -957,7 +1080,7 @@ class TunnerApp(App[None]):
             for arguments, input_text in commands:
                 rendered = render_command(arguments, input_text)
                 try:
-                    run_command(
+                    result = run_command(
                         arguments,
                         access="write",
                         input_text=input_text,
@@ -967,33 +1090,47 @@ class TunnerApp(App[None]):
                         timeout=30,
                     )
                 except (OSError, subprocess.SubprocessError) as error:
-                    apply_log.write(f"FAILED   {rendered}: {error}")
+                    first, *rest = failure_lines(error)
+                    apply_log.write(f"FAILED   {rendered}: {first}")
+                    for line in rest:
+                        apply_log.write(f"         {line}")
                     command_failure_logged = True
                     raise
                 apply_log.write(f"APPLIED  {rendered}")
-        except (OSError, subprocess.SubprocessError, ValueError) as error:
+                # Show what the command reported (nvidia-smi confirms the new
+                # limit, the Intel helper names its backup), but not tee's
+                # echo of the value it was given.
+                echoed = (input_text or "").strip()
+                for line in (result.stdout or "").splitlines():
+                    if line.strip() and line.strip() != echoed:
+                        apply_log.write(f"         {line.strip()}")
+        # Anything, including a programming error while building the plan,
+        # must land in the log rather than tear down the app mid-apply.
+        except Exception as error:
             if not command_failure_logged:
-                apply_log.write(f"FAILED   Apply could not start: {error}")
-            self.query_one("#activity", Static).update(
-                f"● Apply failed: {error}. Run 'sudo -v' in the terminal, then retry."
+                apply_log.write(f"FAILED   Apply could not start: {describe_error(error)}")
+            detail = failure_lines(error)[-1]
+            self.show_activity(
+                f"● Apply failed: {detail}. Run 'sudo -v' in the terminal, then retry.",
+                "#ff6b6b",
             )
             return
         write_last_values(self.settings, applied=True, options=self.options)
         self.last_change = self.last_apply = datetime.now()
-        activity = self.query_one("#activity", Static)
-        activity.styles.color = "#6ee7a8"
-        activity.update("● Applied successfully just now — saved to last-values.json")
+        self.refresh_activity()
         self.refresh_telemetry()
 
     def apply_commands(self) -> list[tuple[list[str], str | None]]:
+        # A control can be missing (its documentation row failed to parse) as
+        # well as unavailable; .get keeps both on the ValueError path.
         values = {s.key: s.value for s in self.settings}
         commands = []
         if self.options['intel-mode'] == 'apply':
-            selected = {key: values[key] for key in intel_controls.SPECS}
+            selected = {key: values.get(key) for key in intel_controls.SPECS}
             intel_controls.updated_config(intel_controls.CONFIG.read_text(), selected)
             commands.append((['sudo', '-n', sys.executable, str(Path(__file__).with_name('intel_controls.py'))], json.dumps(selected)))
         elif self.options['intel-mode'] == 'undervolt':
-            selected = {key: values[key] for key in intel_controls.SPECS}
+            selected = {key: values.get(key) for key in intel_controls.SPECS}
             commands.append((intel_controls.python_undervolt_command(selected), None))
         def write(path, value):
             commands.append((["sudo", "-n", "tee", str(path)], f"{value}\n"))
@@ -1003,7 +1140,7 @@ class TunnerApp(App[None]):
         write('/sys/firmware/acpi/platform_profile', profile)
         if profile == 'custom':
             for key, attribute in [('lenovo-cpu-cross-load-limit', 'ppt_cpu_cl'), ('lenovo-cpu-sustained-limit', 'ppt_pl1_spl'), ('lenovo-cpu-burst-limit', 'ppt_pl2_sppt'), ('lenovo-cpu-temperature-target', 'cpu_temp'), ('lenovo-gpu-temperature-target', 'gpu_temp')]:
-                value = values[key]
+                value = values.get(key)
                 if value is None:
                     raise ValueError(f'{key} unavailable')
                 write(f'/sys/class/firmware-attributes/lenovo-wmi-other-0/attributes/{attribute}/current_value', value)
@@ -1012,8 +1149,8 @@ class TunnerApp(App[None]):
         turbo = self.options['turbo'] == 'on'
         write('/sys/devices/system/cpu/intel_pstate/no_turbo', 0 if turbo else 1)
         for group, policies in cpu_groups().items():
-            low = values[f'cpu-{group}-core-minimum-frequency']
-            high = values[f'cpu-{group}-core-maximum-frequency']
+            low = values.get(f'cpu-{group}-core-minimum-frequency')
+            high = values.get(f'cpu-{group}-core-maximum-frequency')
             if not policies or low is None or high is None or low > high:
                 raise ValueError(f'{group.upper()}-core frequency range unavailable or invalid')
             maximum = (5400 if group == 'p' else 3900) if turbo else (2200 if group == 'p' else 1600)
@@ -1025,7 +1162,7 @@ class TunnerApp(App[None]):
                 write(policy / 'scaling_max_freq', high * 1000)
                 write(policy / 'scaling_min_freq', low * 1000)
         if self.nvidia_power_limit_available:
-            power_limit = values['nvidia-power-ceiling']
+            power_limit = values.get('nvidia-power-ceiling')
             if power_limit is None:
                 raise ValueError('NVIDIA power limit unavailable')
             commands.append((["sudo", "-n", "nvidia-smi", "-i", "0", "-pl", str(power_limit)], None))
@@ -1037,7 +1174,7 @@ class TunnerApp(App[None]):
             if mode == 'auto':
                 arguments.append(reset)
             elif mode == 'locked':
-                low, high = (values[f'nvidia-{domain}-clock-{bound}'] for bound in ('minimum', 'maximum'))
+                low, high = (values.get(f'nvidia-{domain}-clock-{bound}') for bound in ('minimum', 'maximum'))
                 if low is None or high is None or low > high:
                     raise ValueError(f'GPU {domain} clock range invalid or unavailable')
                 arguments.extend([lock, f'{low},{high}'])

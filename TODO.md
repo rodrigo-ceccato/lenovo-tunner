@@ -1,3 +1,1 @@
-- load not setting buttons as previous sections (buttons I edited last session are still greyed out, so not loaded from .json)
-- not reading temperature set with undervolt previsloy
 - not exposing temperature possibilites from python undervolt, showing only lenovo
