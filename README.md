@@ -37,6 +37,12 @@ one row back; **Revert to live** (`v`) puts every editable row back. Each
 change is saved to `last-values.json` after a moment's pause; **Restore
 saved** (`r`) loads it back into the interface, including the mode choices.
 
+To keep several plans, **Save profile…** (`s`) stores every preview value
+and mode choice under a name in `profiles.json`; saving under an existing
+name replaces it. **Load profile…** (`o`) lists the saved profiles with the
+time each was saved: Enter loads the highlighted one into the plan (nothing
+is written to hardware until you Apply) and Delete removes it.
+
 CPU policies are grouped by base frequency, so a hybrid CPU gets independent
 P-core and E-core floors and ceilings and a uniform CPU gets one pair; a
 driver that reports no base frequency (amd-pstate) gets one pair too, since
@@ -45,10 +51,17 @@ bounds come from the driver's `cpuinfo_min_freq`/`cpuinfo_max_freq`. With
 Turbo off the ceiling must stay at or below the base frequency, because the
 kernel caps there anyway; without an `intel_pstate` Turbo switch the selector
 is disabled, nothing is written for it, and the rated maximum is the limit.
+Since the driver only reports the boost range while Turbo is on, the
+ceiling rows widen once Turbo is actually enabled: the bounds are re-read
+after an Apply and on every telemetry poll, so they also follow a Turbo
+change made by another tool or published by the driver a moment late. A poll
+only ever widens them; a narrower range (Turbo turned off elsewhere) never
+clamps a preview, and Apply rejects a plan the driver can no longer take.
 For a 4 GHz P-core cap on an i9-13900HX, select Turbo On and set the P-core
 maximum to 4000 MHz.
 
-Keys: `a` Apply · `r` Restore saved · `v` Revert to live · `c`/`g` toggle CPU
+Keys: `a` Apply · `r` Restore saved · `v` Revert to live · `s`/`o` save or
+load a profile · `c`/`g` toggle CPU
 or GPU stress · `t` show or hide the status pane · `l` jump to the Apply log ·
 `q` quit. While a value field has focus only `a`, `t` and `l` still work as
 shortcuts; every other letter is swallowed, so a stray `q` cannot quit or `r`

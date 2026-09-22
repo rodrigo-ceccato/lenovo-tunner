@@ -39,11 +39,13 @@ from textual.widgets import (
     Input,
     Label,
     LoadingIndicator,
+    OptionList,
     RichLog,
     Select,
     Sparkline,
     Static,
 )
+from textual.widgets.option_list import Option
 
 import intel_controls
 from command_log import record_command, render_command
@@ -51,6 +53,9 @@ from command_log import record_command, render_command
 
 DOCUMENT = Path(__file__).with_name("lenovo-tuning.md")
 LAST_VALUES = Path(__file__).with_name("last-values.json")
+# Named snapshots of the plan, saved and loaded from the Profiles dialogs.
+PROFILES_FILE = Path(__file__).with_name("profiles.json")
+PROFILE_NAME_LENGTH = 40
 LENOVO_ATTRIBUTES = {
     "lenovo-cpu-cross-load-limit": "ppt_cpu_cl",
     "lenovo-cpu-sustained-limit": "ppt_pl1_spl",
@@ -278,6 +283,9 @@ class Telemetry:
     gpu_headroom: float | None = None
     gpu_reasons: str = "Unavailable"
     intel_limits: str = "PL1: unavailable\nPL2: unavailable"
+    # group -> (floor, ceiling) MHz the driver allows now; Turbo moves the
+    # ceiling, so the rows' bounds follow it rather than the startup probe.
+    cpu_limits: dict[str, tuple[int, int]] = field(default_factory=dict)
 
     @staticmethod
     def bar(value: float | None, ceiling: float | None, width: int = BAR_WIDTH) -> str:
@@ -384,6 +392,19 @@ def cpu_group_limits(policies: list[Path]) -> tuple[int, int | None, int]:
     except (OSError, ValueError):
         base = None
     return floor, base, ceiling
+
+
+def cpu_driver_limits(groups: dict[str, list[Path]]) -> dict[str, tuple[int, int]]:
+    """Each group's current (floor, ceiling) in MHz; unreadable groups are left out."""
+    limits = {}
+    for group, policies in groups.items():
+        try:
+            floor, _, ceiling = cpu_group_limits(policies)
+        except (OSError, ValueError):
+            continue
+        if floor <= ceiling:
+            limits[group] = (floor, ceiling)
+    return limits
 
 
 def cpu_group_name(group: str) -> str:
@@ -769,31 +790,74 @@ def read_telemetry(groups: dict[str, list[Path]]) -> Telemetry:
     telemetry.turbo_enabled = turbo_state()
     telemetry.profile = live_profile()
     telemetry.cpu_policies, telemetry.cpu_clock = describe_cpu_policies(groups)
+    telemetry.cpu_limits = cpu_driver_limits(groups)
     telemetry.intel_limits = intel_controls.live_limits()
     return telemetry
+
+
+def saved_preview(payload: object) -> tuple[dict[str, int], dict[str, str]]:
+    """The integer preview values and option names in one saved payload.
+
+    Anything malformed reads as nothing saved rather than an error.
+    """
+    values = payload.get("values") if isinstance(payload, dict) else None
+    options = payload.get("options") if isinstance(payload, dict) else None
+    values = values if isinstance(values, dict) else {}
+    options = options if isinstance(options, dict) else {}
+    return (
+        {key: value for key, value in values.items() if type(value) is int},
+        {key: value for key, value in options.items() if isinstance(value, str)},
+    )
+
+
+def preview_payload(settings: list[TuningValue], options=None) -> dict[str, object]:
+    """The previews and mode choices as saved to disk, stamped with the time."""
+    return {
+        "options": dict(options or {}),
+        "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "values": {setting.key: setting.value for setting in settings if setting.value is not None},
+    }
 
 
 def load_saved_state() -> tuple[dict[str, int], dict[str, str]]:
     """Load the integer preview values and option names saved previously."""
     try:
-        payload = json.loads(LAST_VALUES.read_text(encoding="utf-8"))
-        values = payload.get("values", {})
-        options = payload.get("options", {})
-        return (
-            {key: value for key, value in values.items() if type(value) is int},
-            {key: value for key, value in options.items() if isinstance(value, str)},
-        )
+        return saved_preview(json.loads(LAST_VALUES.read_text(encoding="utf-8")))
     except (OSError, ValueError, AttributeError):
         return {}, {}
 
 
+def load_profiles() -> dict[str, dict[str, object]]:
+    """Every named profile in profiles.json; a missing or broken file has none."""
+    try:
+        payload = json.loads(PROFILES_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {name: profile for name, profile in payload.items() if isinstance(profile, dict)}
+
+
+def write_profiles(profiles: dict[str, dict[str, object]]) -> None:
+    PROFILES_FILE.write_text(json.dumps(profiles, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def save_profile(name: str, settings: list[TuningValue], options: dict[str, str]) -> None:
+    """Store the plan under `name`, replacing a profile of that name; no hardware is touched."""
+    profiles = load_profiles()
+    profiles[name] = preview_payload(settings, options)
+    write_profiles(profiles)
+
+
+def delete_profile(name: str) -> None:
+    profiles = load_profiles()
+    if profiles.pop(name, None) is not None:
+        write_profiles(profiles)
+
+
 def write_last_values(settings: list[TuningValue], applied: bool = False, options=None) -> None:
     """Persist preview values; this never applies a hardware setting."""
-    payload: dict[str, object] = {
-        "options": options or {},
-        "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "values": {setting.key: setting.value for setting in settings if setting.value is not None},
-    }
+    payload = preview_payload(settings, options)
     if applied:
         payload["applied_at"] = payload["updated_at"]
     else:
@@ -1032,6 +1096,25 @@ class ValueRow(Horizontal):
             # that would re-check it against stale bounds and clear it.
             with value.prevent(Input.Changed):
                 value.value = expected
+        self.refresh_decorations()
+
+    def refresh_bounds(self) -> None:
+        """Follow new bounds without replacing text the user is still typing.
+
+        A half-typed value is not a setting yet, so its field is left alone,
+        but it is checked again: text the old bounds rejected may fit the new
+        ones. Otherwise refresh_value only rewrites text that bounds clamped.
+        """
+        if self.setting.value is not None:
+            self.refresh_value()
+            return
+        self.range_validator.minimum = self.setting.minimum
+        self.range_validator.maximum = self.setting.maximum
+        value = self.query_one("#value", Input)
+        result = value.validate(value.value) if value.value else None
+        if result is not None and result.is_valid:
+            self.setting.value = int(value.value)
+            self.post_message(self.Changed(self))
         self.refresh_decorations()
 
     def refresh_decorations(self) -> None:
@@ -1330,6 +1413,9 @@ class TuningPlan(VerticalScroll):
         with Horizontal(id="workloads"):
             yield Button("Stress CPU", id="stress-cpu")
             yield Button("Stress GPU", id="stress-gpu")
+        with Horizontal(id="profile-actions"):
+            yield Button("Save profile…", id="save-profile")
+            yield Button("Load profile…", id="load-profile")
         with Horizontal(id="actions"):
             yield Button("Restore saved", id="restore")
             yield Button("Revert to live", id="revert")
@@ -1401,6 +1487,162 @@ class ApplyConfirmation(ModalScreen[ApplyPlan | None]):
         event.stop()
 
 
+class SaveProfileDialog(ModalScreen[str | None]):
+    """Ask for a name to store the current plan under."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, existing: Iterable[str]) -> None:
+        super().__init__()
+        self.existing = sorted(existing)
+
+    def compose(self) -> ComposeResult:
+        with Container(classes="profile-dialog"):
+            yield Static("Save the plan as a profile", classes="dialog-title")
+            yield Static(
+                "Stores every preview value and mode choice; nothing is applied.",
+                classes="dialog-note",
+            )
+            yield Input(
+                placeholder="Profile name", id="profile-name", max_length=PROFILE_NAME_LENGTH,
+            )
+            yield Static(self.default_hint(), id="profile-hint", markup=False)
+            with Horizontal(classes="dialog-buttons"):
+                yield Button("Save", id="save", variant="primary")
+                yield Button("Cancel", id="cancel")
+
+    def default_hint(self) -> str:
+        if not self.existing:
+            return "No profiles saved yet."
+        return "Saved: " + ", ".join(self.existing)
+
+    def on_mount(self) -> None:
+        self.query_one("#profile-name", Input).focus()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        name = event.value.strip()
+        hint = self.query_one("#profile-hint", Static)
+        hint.remove_class("error")
+        hint.update(f"Replaces the saved profile “{name}”." if name in self.existing else self.default_hint())
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        self.action_save()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "save":
+            self.action_save()
+        else:
+            self.action_cancel()
+
+    def action_save(self) -> None:
+        name = self.query_one("#profile-name", Input).value.strip()
+        if not name:
+            hint = self.query_one("#profile-hint", Static)
+            hint.add_class("error")
+            hint.update("Type a name first.")
+            return
+        self.dismiss(name)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class LoadProfileDialog(ModalScreen[str | None]):
+    """Pick a saved profile to load into the plan, or delete one."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("delete", "delete", "Delete profile"),
+        # The list has focus, so q would otherwise quit the app behind it.
+        Binding("q", "cancel", "Cancel", show=False),
+    ]
+
+    def __init__(self, profiles: dict[str, dict[str, object]]) -> None:
+        super().__init__()
+        self.profiles = profiles
+
+    def compose(self) -> ComposeResult:
+        with Container(classes="profile-dialog"):
+            yield Static("Load a profile into the plan", classes="dialog-title")
+            yield Static(
+                "Loading only changes the previews; press Apply afterwards to set hardware.",
+                classes="dialog-note",
+            )
+            yield OptionList(*self.options(), id="profile-list")
+            yield Static("", id="profile-hint", markup=False)
+            with Horizontal(classes="dialog-buttons"):
+                yield Button("Load", id="load", variant="primary")
+                yield Button("Delete", id="delete", variant="error")
+                yield Button("Cancel", id="cancel")
+
+    def options(self) -> list[Option]:
+        options = []
+        for name in sorted(self.profiles, key=str.casefold):
+            saved_at = self.profiles[name].get("updated_at")
+            stamp = saved_at.replace("T", " ")[:16] if isinstance(saved_at, str) else "unknown time"
+            options.append(Option(Text(f"{name}  ·  saved {stamp}"), id=name))
+        return options
+
+    def on_mount(self) -> None:
+        self.query_one("#profile-list", OptionList).focus()
+        self.refresh_empty()
+
+    def refresh_empty(self) -> None:
+        empty = not self.profiles
+        self.query_one("#load", Button).disabled = empty
+        self.query_one("#delete", Button).disabled = empty
+        if empty:
+            self.query_one("#profile-hint", Static).update("No profiles saved yet; press s on the plan to save one.")
+
+    def selected(self) -> str | None:
+        profile_list = self.query_one("#profile-list", OptionList)
+        if profile_list.highlighted is None:
+            return None
+        return profile_list.get_option_at_index(profile_list.highlighted).id
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        self.dismiss(event.option.id)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "load":
+            name = self.selected()
+            if name is not None:
+                self.dismiss(name)
+        elif event.button.id == "delete":
+            self.action_delete()
+        else:
+            self.action_cancel()
+
+    def action_delete(self) -> None:
+        name = self.selected()
+        if name is None:
+            return
+        hint = self.query_one("#profile-hint", Static)
+        try:
+            delete_profile(name)
+        except OSError as error:
+            hint.update(f"Could not delete “{name}”: {error}")
+            return
+        self.profiles.pop(name, None)
+        profile_list = self.query_one("#profile-list", OptionList)
+        index = profile_list.highlighted or 0
+        profile_list.clear_options()
+        profile_list.add_options(self.options())
+        # clear_options drops the highlight, which would leave Enter, Load
+        # and Delete doing nothing until an arrow key picked a row again.
+        if profile_list.option_count:
+            profile_list.highlighted = min(index, profile_list.option_count - 1)
+        hint.update(f"Deleted “{name}”.")
+        self.refresh_empty()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class TunnerCommands(Provider):
     """Expose the tuner's actions to the command palette (ctrl+p)."""
 
@@ -1408,6 +1650,8 @@ class TunnerCommands(Provider):
         ("Apply plan to hardware", "apply", "Review the planned commands, then confirm"),
         ("Restore saved preview", "restore", "Load last-values.json into the plan"),
         ("Revert to live values", "revert", "Discard every edit since startup or the last Apply"),
+        ("Save plan as profile", "save_profile", "Store the previews and modes under a name"),
+        ("Load saved profile", "load_profile", "Replace the plan with a named profile"),
         ("Toggle CPU stress", "stress('cpu')", "Start or stop the CPU workload"),
         ("Toggle GPU stress", "stress('gpu')", "Start or stop the CUDA workload"),
         ("Toggle live status pane", "toggle_rail", "Show or hide telemetry"),
@@ -1462,9 +1706,9 @@ class TunnerApp(App[None]):
     .value { width: 13; }
     .step { min-width: 5; width: 5; }
     .toggle-row .choice { width: 22; margin-left: 1; }
-    #workloads { height: auto; margin-top: 1; }
+    #workloads, #profile-actions { height: auto; margin-top: 1; }
     #actions { dock: bottom; height: auto; margin-top: 1; padding: 1 0 0 0; background: $background; }
-    #workloads Button, #actions Button { margin-right: 1; }
+    #workloads Button, #profile-actions Button, #actions Button { margin-right: 1; }
     #apply-log-title { color: $primary; text-style: bold; margin-top: 1; }
     #apply-log { height: 10; border: solid $border-blurred; padding: 0 1; background: $surface; }
     #apply-log:focus { border: solid $border; }
@@ -1489,11 +1733,22 @@ class TunnerApp(App[None]):
     #confirm-prompt Button { margin-left: 1; }
     #confirm-warning { color: $warning; margin-bottom: 1; }
     #confirm-commands { height: 1fr; border: solid $border-blurred; padding: 0 1; }
+    SaveProfileDialog, LoadProfileDialog { align: center middle; background: $background 60%; }
+    .profile-dialog { width: 90%; max-width: 72; height: auto; max-height: 90%; padding: 1 2; background: $panel; border: solid $border; }
+    .dialog-title { text-style: bold; }
+    .dialog-note { color: $text-muted; margin-bottom: 1; }
+    #profile-list { height: auto; max-height: 14; }
+    #profile-hint { color: $text-muted; margin-top: 1; }
+    #profile-hint.error { color: $error; }
+    .dialog-buttons { height: auto; margin-top: 1; }
+    .dialog-buttons Button { margin-right: 1; }
     """
     BINDINGS = [
         Binding("a", "apply", "Apply"),
         Binding("r", "restore", "Restore"),
         Binding("v", "revert", "Revert all", show=False),
+        Binding("s", "save_profile", "Save profile"),
+        Binding("o", "load_profile", "Load profile"),
         Binding("c", "stress('cpu')", "Stress CPU", show=False),
         Binding("g", "stress('gpu')", "Stress GPU", show=False),
         Binding("t", "toggle_rail", "Status"),
@@ -1501,6 +1756,11 @@ class TunnerApp(App[None]):
         Binding("q", "quit", "Quit"),
     ]
     COMMANDS = App.COMMANDS | {TunnerCommands}
+    # Actions that act on the plan behind a profile dialog; while one is
+    # open its keys belong to the dialog.
+    PLAN_ACTIONS = frozenset({
+        "apply", "restore", "revert", "save_profile", "load_profile", "stress", "toggle_rail", "show_log",
+    })
 
     def __init__(self) -> None:
         super().__init__()
@@ -1604,6 +1864,11 @@ class TunnerApp(App[None]):
     def plan_ready(self) -> bool:
         return self.plan is not None
 
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action in self.PLAN_ACTIONS and isinstance(self.screen, (SaveProfileDialog, LoadProfileDialog)):
+            return False
+        return super().check_action(action, parameters)
+
     def on_resize(self, event: Resize) -> None:
         self.update_layout(event.size.width)
 
@@ -1684,6 +1949,10 @@ class TunnerApp(App[None]):
             self.action_restore()
         elif button_id == "revert":
             self.action_revert()
+        elif button_id == "save-profile":
+            self.action_save_profile()
+        elif button_id == "load-profile":
+            self.action_load_profile()
         elif button_id == "apply":
             self.action_apply()
 
@@ -1845,33 +2114,53 @@ class TunnerApp(App[None]):
             row.refresh_value()
 
     def refresh_cpu_clock_ranges(self) -> None:
-        """Refresh CPU row bounds after a successful Turbo-state write.
+        """Re-read the CPU driver limits now, after a Turbo-state write."""
+        self.update_cpu_clock_bounds(cpu_driver_limits(self.cpu_groups))
+
+    def update_cpu_clock_bounds(
+        self, limits: dict[str, tuple[int, int]], widen_only: bool = False,
+    ) -> bool:
+        """Give the CPU rows the driver's current bounds; True when any moved.
 
         intel_pstate lowers ``cpuinfo_max_freq`` to the base clock while
-        Turbo is disabled.  The original probe therefore cannot know the
-        boost range until Turbo has been enabled.  Keep the user's preview,
-        but replace the bounds and validators as soon as the driver reports
-        the new range.
+        Turbo is disabled, so the startup probe cannot know the boost range
+        until Turbo is on. The driver may publish it a moment after the
+        no_turbo write, an Apply that failed later on still turned Turbo on,
+        and another tool can flip it too, so every telemetry poll brings the
+        limits here, not only a successful Apply. Previews are kept, only
+        clamped into the new range.
+
+        A poll passes widen_only: Turbo turned off behind the app's back must
+        not quietly clamp a preview, which would stay clamped once Turbo came
+        back. Narrower driver limits are still enforced when Apply plans.
         """
         settings = {setting.key: setting for setting in self.settings}
-        for group, policies in self.cpu_groups.items():
-            try:
-                floor, _, ceiling = cpu_group_limits(policies)
-            except (OSError, ValueError):
-                continue
+        moved: set[str] = set()
+        for group, (floor, ceiling) in limits.items():
             for bound in ("minimum", "maximum"):
                 setting = settings.get(f"cpu-{group}-core-{bound}-frequency")
-                if setting is None:
+                # A row the probe could not read stays unavailable.
+                if setting is None or setting.unavailable_reason is not None:
                     continue
-                setting.minimum, setting.maximum = floor, ceiling
+                low, high = floor, ceiling
+                if widen_only:
+                    low, high = min(low, setting.minimum), max(high, setting.maximum)
+                if (setting.minimum, setting.maximum) == (low, high):
+                    continue
+                setting.minimum, setting.maximum = low, high
                 if setting.value is not None:
-                    setting.value = max(floor, min(ceiling, setting.value))
+                    setting.value = max(low, min(high, setting.value))
                 if setting.live is not None:
-                    setting.live = max(floor, min(ceiling, setting.live))
+                    setting.live = max(low, min(high, setting.live))
+                moved.add(setting.key)
+        if not moved:
+            return False
         self.cpu_boost = cpu_boost_text(self.cpu_groups)
+        self.telemetry.cpu_boost = self.cpu_boost
         for row in self.query(ValueRow):
-            if row.setting.key.startswith("cpu-"):
-                row.refresh_value()
+            if row.setting.key in moved:
+                row.refresh_bounds()
+        return True
 
     def show_activity(self, text: str, tone: str = "ok") -> None:
         """Show a one-off message and keep it until something newer happens."""
@@ -1916,6 +2205,8 @@ class TunnerApp(App[None]):
     def apply_telemetry(self, telemetry: Telemetry) -> None:
         if not self.is_running:
             return
+        if self.plan_ready:
+            self.update_cpu_clock_bounds(telemetry.cpu_limits, widen_only=True)
         telemetry.cpu_boost = self.cpu_boost
         self.telemetry = telemetry
         for name, trend in self.history.items():
@@ -2023,6 +2314,15 @@ class TunnerApp(App[None]):
             self.save_timer.stop()
             self.save_timer = None
         saved, options = load_saved_state()
+        restored = self.load_preview(saved, options)
+        self.last_change = datetime.now()
+        self.show_activity(
+            f"● Restored {restored} saved preview value(s); press Apply to set hardware"
+        )
+        self.refresh_status_rail()
+
+    def load_preview(self, saved: dict[str, int], options: dict[str, str]) -> int:
+        """Put saved previews and mode choices into the plan; returns the values loaded."""
         allowed = {
             "intel-mode": ["keep", "apply", "undervolt"],
             "profile": self.profiles,
@@ -2043,7 +2343,11 @@ class TunnerApp(App[None]):
             value = saved.get(setting.key)
             if value is None:
                 continue
-            if setting.value is None:
+            # A row whose typed text was rejected also has no value, but its
+            # reading and bounds are known: clamp into them like any other.
+            if setting.value is None and (
+                setting.unavailable_reason is not None or setting.key.startswith("intel-")
+            ):
                 if setting.key.startswith("intel-"):
                     # The spec bounds are known even without a config file,
                     # so a saved value inside them is a valid preview.
@@ -2062,9 +2366,48 @@ class TunnerApp(App[None]):
                 setting.value = max(setting.minimum, min(setting.maximum, value))
             restored += 1
         self.update_row_disabled_state()
+        return restored
+
+    def action_save_profile(self) -> None:
+        if not self.plan_ready or isinstance(self.screen, ModalScreen):
+            return
+        for row in self.query(ValueRow):
+            row.commit_input()
+        self.push_screen(SaveProfileDialog(load_profiles()), self.save_profile)
+
+    def save_profile(self, name: str | None) -> None:
+        if name is None:
+            return
+        try:
+            save_profile(name, self.settings, self.options)
+        except OSError as error:
+            message = f"Could not save profile “{name}”: {error}"
+            self.show_activity(f"● {message}", "error")
+            self.notify(message, severity="error", timeout=10)
+            return
+        self.show_activity(f"● Saved profile “{name}” to {PROFILES_FILE.name}")
+
+    def action_load_profile(self) -> None:
+        if not self.plan_ready or self.applying or isinstance(self.screen, ModalScreen):
+            return
+        self.push_screen(LoadProfileDialog(load_profiles()), self.load_profile)
+
+    def load_profile(self, name: str | None) -> None:
+        if name is None or self.applying:
+            return
+        profile = load_profiles().get(name)
+        if profile is None:
+            self.show_activity(f"● Profile “{name}” is no longer saved", "error")
+            return
+        if self.save_timer is not None:
+            self.save_timer.stop()
+            self.save_timer = None
+        loaded = self.load_preview(*saved_preview(profile))
+        # The loaded plan is the new preview, so last-values.json follows it.
         self.last_change = datetime.now()
+        self.schedule_save()
         self.show_activity(
-            f"● Restored {restored} saved preview value(s); press Apply to set hardware"
+            f"● Loaded profile “{name}” ({loaded} value(s)); press Apply to set hardware"
         )
         self.refresh_status_rail()
 
@@ -2080,7 +2423,7 @@ class TunnerApp(App[None]):
         self.refresh_status_rail()
 
     def set_apply_controls(self, enabled: bool) -> None:
-        for selector in ("#apply", "#restore", "#revert"):
+        for selector in ("#apply", "#restore", "#revert", "#load-profile"):
             self.query_one(selector, Button).disabled = not enabled
 
     def action_apply(self) -> None:

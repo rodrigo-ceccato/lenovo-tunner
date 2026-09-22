@@ -76,6 +76,7 @@ def headless_app(stack, *, settings=(), cpu=(), nvidia=(), intel=(), legion=(), 
     (directory / "platform_profile_choices").write_text(" ".join(PROFILES) + "\n")
     (directory / "platform_profile").write_text(profile + "\n")
     stack.enter_context(patch("app.PLATFORM_PROFILE", directory / "platform_profile"))
+    stack.enter_context(patch("app.PROFILES_FILE", directory / "profiles.json"))
     if saved is None:
         stack.enter_context(patch("app.write_last_values"))
     else:
@@ -1300,6 +1301,147 @@ class LayoutTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((floor.maximum, ceiling.maximum), (5400, 5400))
                 row = next(row for row in app.query(ValueRow) if row.setting is ceiling)
                 self.assertIn("800–5400 MHz", str(row.query_one("#range", Static).render()))
+
+    async def test_telemetry_poll_brings_turbo_bounds_without_an_apply(self):
+        # The driver may publish the boost ceiling after the Apply finished,
+        # or an Apply that failed later still turned Turbo on; the next poll
+        # must widen the rows and re-enable their + buttons.
+        ceiling = TuningValue("CPU P-core maximum frequency", 2200, 800, 2200, "MHz", 100)
+        ceiling.live = 2200
+        with ExitStack() as stack:
+            app = headless_app(stack, cpu=[ceiling])
+            stack.enter_context(patch("app.cpu_groups", return_value={"p": [Path("/policy0")]}))
+            stack.enter_context(patch("app.cpu_boost_text", return_value="Rated boost unavailable"))
+            async with app.run_test() as pilot:
+                await settle(app, pilot)
+                row = next(row for row in app.query(ValueRow) if row.setting is ceiling)
+                self.assertTrue(row.query_one("#up", Button).disabled)
+
+                app.apply_telemetry(Telemetry(cpu_limits={"p": (800, 5400)}))
+                await pilot.pause()
+
+                self.assertEqual(ceiling.maximum, 5400)
+                self.assertFalse(row.query_one("#up", Button).disabled)
+                self.assertIn("800–5400 MHz", str(row.query_one("#range", Static).render()))
+
+    async def test_telemetry_poll_never_narrows_bounds_or_clamps_a_preview(self):
+        # Turbo turned off by another tool must not quietly cut a planned
+        # ceiling, which would stay cut once Turbo came back on.
+        ceiling = clock_row(4500)
+        with ExitStack() as stack:
+            app = headless_app(stack, cpu=[ceiling])
+            stack.enter_context(patch("app.cpu_groups", return_value={"p": [Path("/policy0")]}))
+            async with app.run_test() as pilot:
+                await settle(app, pilot)
+                app.apply_telemetry(Telemetry(cpu_limits={"p": (800, 2200)}))
+                await pilot.pause()
+                self.assertEqual((ceiling.minimum, ceiling.maximum), (800, 5400))
+                self.assertEqual(ceiling.value, 4500)
+
+    async def test_widened_bounds_accept_text_the_old_bounds_rejected(self):
+        ceiling = TuningValue("CPU P-core maximum frequency", 2200, 800, 2200, "MHz", 100)
+        ceiling.live = 2200
+        with ExitStack() as stack:
+            app = headless_app(stack, cpu=[ceiling])
+            stack.enter_context(patch("app.cpu_groups", return_value={"p": [Path("/policy0")]}))
+            async with app.run_test() as pilot:
+                stack.enter_context(patch("app.cpu_boost_text", return_value="Rated boost unavailable"))
+                await settle(app, pilot)
+                row = next(row for row in app.query(ValueRow) if row.setting is ceiling)
+                row.query_one("#value", Input).value = "5000"
+                await pilot.pause()
+                self.assertIsNone(ceiling.value)
+
+                app.apply_telemetry(Telemetry(cpu_limits={"p": (800, 5400)}))
+                await pilot.pause()
+                self.assertEqual(ceiling.value, 5000)
+                self.assertEqual(row.query_one("#value", Input).value, "5000")
+
+    async def test_loading_over_rejected_text_keeps_the_row_editable(self):
+        setting = clock_row(3000)
+        with ExitStack() as stack:
+            app = headless_app(stack, settings=[setting], saved={})
+            async with app.run_test(size=(120, 40)) as pilot:
+                await settle(app, pilot)
+                app_module.save_profile("fast", app.settings, app.options)
+                row = app.query_one(ValueRow)
+                row.query_one("#value", Input).value = "12"
+                await pilot.pause()
+                self.assertIsNone(setting.value)
+
+                app.load_profile("fast")
+                await pilot.pause()
+                self.assertEqual(setting.value, 3000)
+                self.assertEqual((setting.minimum, setting.maximum), (800, 5400))
+                self.assertIsNone(setting.unavailable_reason)
+
+    async def test_profiles_save_and_load_through_the_dialogs(self):
+        setting = clock_row(3000)
+        with ExitStack() as stack:
+            app = headless_app(stack, settings=[setting], saved={})
+            async with app.run_test(size=(120, 40)) as pilot:
+                await settle(app, pilot)
+                await pilot.press("s")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, app_module.SaveProfileDialog)
+                # Plan keys belong to the dialog while it is open.
+                await pilot.press(*"gaming", "enter")
+                await pilot.pause()
+                self.assertNotIsInstance(app.screen, app_module.SaveProfileDialog)
+                self.assertEqual(app_module.load_profiles()["gaming"]["values"][setting.key], 3000)
+
+                setting.value = 2000
+                app.query_one(ValueRow).refresh_value()
+                await pilot.press("o")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, app_module.LoadProfileDialog)
+                await pilot.press("enter")
+                await settle(app, pilot)
+
+                self.assertEqual(setting.value, 3000)
+                self.assertEqual(app.query_one(ValueRow).query_one("#value", Input).value, "3000")
+                self.assertIn("Loaded profile “gaming”", activity_text(app))
+                self.assertIsNotNone(app.save_timer)  # the loaded plan is saved as the preview
+                app.flush_save()
+                saved = json.loads(app_module.LAST_VALUES.read_text())
+                self.assertEqual(saved["values"][setting.key], 3000)
+
+    async def test_loading_a_profile_restores_its_modes_and_delete_removes_it(self):
+        with ExitStack() as stack:
+            app = headless_app(stack, settings=[clock_row(3000)], saved={})
+            async with app.run_test(size=(120, 40)) as pilot:
+                await settle(app, pilot)
+                app.options["core-mode"] = "locked"
+                app_module.save_profile("locked", app.settings, app.options)
+                app_module.save_profile("spare", app.settings, app.options)
+                app.options["core-mode"] = "keep"
+
+                app.load_profile("locked")
+                await pilot.pause()
+                self.assertEqual(app.options["core-mode"], "locked")
+                self.assertEqual(app.query_one("#core-mode", Select).value, "locked")
+
+                app.action_load_profile()
+                await pilot.pause()
+                await pilot.press("down", "delete")
+                await pilot.pause()
+                self.assertEqual(set(app_module.load_profiles()), {"locked"})
+                # The remaining profile is highlighted, so Delete still works.
+                self.assertEqual(app.screen.selected(), "locked")
+                await pilot.press("q")
+                await pilot.pause()
+                self.assertTrue(app.is_running)  # q closes the dialog, not the app
+                self.assertNotIsInstance(app.screen, app_module.LoadProfileDialog)
+
+    def test_a_broken_profiles_file_reads_as_no_profiles(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "profiles.json"
+            with patch("app.PROFILES_FILE", path):
+                self.assertEqual(app_module.load_profiles(), {})
+                path.write_text("[1, 2]")
+                self.assertEqual(app_module.load_profiles(), {})
+                path.write_text(json.dumps({"odd": {"values": [1], "options": "x"}}))
+                self.assertEqual(app_module.saved_preview(app_module.load_profiles()["odd"]), ({}, {}))
 
     async def test_startup_selects_do_not_refresh_every_row_again(self):
         # Every Select posts Changed for its initial value at mount; those
